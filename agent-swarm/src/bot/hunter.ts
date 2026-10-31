@@ -17,7 +17,9 @@ import type { Bot } from "mineflayer";
 import type { Entity } from "prismarine-entity";
 import { Vec3 } from "vec3";
 import pkg from "mineflayer-pathfinder";
-import { huntPlayer } from "./squad.js";
+import { huntPlayer, ALL_BOT_NAMES, SQUAD } from "./squad.js";
+import { CombatLearner, availableTactics, type CombatState, type Tactic } from "../learn/combat-learner.js";
+import { PearlAim } from "../learn/pearl-aim.js";
 import { baseMoves } from "./navigation.js";
 import { abortActiveSkill, isSkillRunning } from "../skills/executor.js";
 
@@ -160,18 +162,65 @@ export function startShieldKeeper(bot: Bot): void {
   bot.once("end", () => clearInterval(iv));
 }
 
+// ── Learning (shared by every bot in this squad process) ────────────────────
+let learner: CombatLearner | null = null;
+let aimModel: PearlAim | null = null;
+
+/** The squad's combat learner and pearl-aim model (created on first use). */
+export function learners(): { combat: CombatLearner; pearl: PearlAim } {
+  if (!learner || !aimModel) {
+    learner = new CombatLearner(SQUAD);
+    aimModel = new PearlAim(SQUAD);
+    const l = learner;
+    setInterval(() => {
+      try {
+        l.save();
+      } catch (err) {
+        console.warn(`[Learn] save failed: ${(err as Error).message}`);
+      }
+    }, 30_000).unref();
+    setInterval(() => {
+      const s = l.summary();
+      const last = s.curve.at(-1);
+      console.log(
+        `[Learn] squad ${SQUAD}: ${s.updates} updates, eps=${s.epsilon.toFixed(3)}, ${s.statesVisited} states, ` +
+          `kills ${s.kills}, deaths ${s.deaths}${last !== undefined ? `, mean reward (last 25) ${last.toFixed(2)}` : ""}`,
+      );
+    }, 60_000).unref();
+  }
+  return { combat: learner, pearl: aimModel };
+}
+
+const DECISION_MS = 1200;
+
+interface Window {
+  state: CombatState;
+  tactic: Tactic;
+  explored: boolean;
+  start: number;
+  dist0: number;
+  hits: number;
+  hpLost: number;
+  side: "left" | "right";
+}
+
 export function startHunter(bot: Bot, brain: Pausable): void {
   const name = huntPlayer();
   if (!huntIsPrimary()) return;
   startTracker(name);
+  const { combat, pearl } = learners();
 
   let hunting = false;
   let lastSwing = 0;
   let lastGoal: Vec3 | null = null;
   let followed: Entity | null = null;
+  let goalKind = "";
   let lastEquip = 0;
   let lastLog = 0;
   let blocking = false;
+  let win: Window | null = null;
+  let pearlBusy = false;
+  let lastHp = 20;
 
   // A raised shield slows the bot to sneaking speed: lower it to run or swing.
   const lowerShield = () => {
@@ -180,15 +229,215 @@ export function startHunter(bot: Bot, brain: Pausable): void {
     bot.deactivateItem();
   };
 
+  const pearls = () => bot.inventory.items().filter((i) => i.name === "ender_pearl").reduce((n, i) => n + i.count, 0);
+
+  const observe = (ent: Entity): CombatState => {
+    const me = bot.entity.position;
+    const flags = Number((ent as unknown as { metadata?: unknown[] }).metadata?.[8] ?? 0);
+    let allies = 0;
+    for (const n of ALL_BOT_NAMES) {
+      const e = bot.players[n]?.entity;
+      if (e && e.position.distanceTo(ent.position) <= 6) allies++;
+    }
+    return {
+      dist: ent.position.distanceTo(me),
+      hp: bot.health,
+      targetShielding: (flags & 0x01) === 1,
+      dy: ent.position.y - me.y,
+      alliesNearTarget: allies,
+    };
+  };
+
+  const resetMotion = () => {
+    lowerShield();
+    bot.clearControlStates();
+    followed = null;
+    goalKind = "";
+  };
+
+  /** Close the current window: score it, update Q, log the experience. */
+  const finish = (next: CombatState | null, terminal: "kill" | "death" | null, teamKill = false) => {
+    if (!win) return;
+    const w = win;
+    win = null;
+    const dist1 = next?.dist ?? w.dist0;
+    const closed = w.dist0 > 4 ? Math.max(-5, Math.min(10, w.dist0 - dist1)) : 0;
+    let reward = w.hits * 1.0 - w.hpLost * 0.5 + closed / 5;
+    if (terminal === "kill") reward += 10;
+    if (terminal === "death") reward -= 10;
+    if (teamKill) reward += 2;
+    const nextOptions = next ? availableTactics(next, pearls(), shieldInOffhand(bot)) : [];
+    combat.update(w.state, w.tactic, reward, terminal ? null : next, nextOptions);
+    combat.record({
+      ts: new Date().toISOString(),
+      bot: bot.username,
+      state: `${w.state.dist.toFixed(1)}b hp${w.state.hp.toFixed(0)}${w.state.targetShielding ? " shield" : ""}`,
+      tactic: w.tactic,
+      explored: w.explored,
+      epsilon: +combat.epsilon.toFixed(3),
+      reward: +reward.toFixed(2),
+      hits: w.hits,
+      damageTaken: +w.hpLost.toFixed(1),
+      closed: +closed.toFixed(1),
+      terminal,
+    });
+    if (w.hits || terminal || w.tactic.startsWith("pearl")) {
+      console.log(
+        `[Learn] ${bot.username} ${w.tactic}${w.explored ? " (explore)" : ""}: hits ${w.hits}, took ${w.hpLost.toFixed(0)}, reward ${reward.toFixed(2)}${terminal ? ` [${terminal}]` : ""}`,
+      );
+    }
+  };
+
+  /** Throw a pearl at a point using the learned aim; learn from where we land. */
+  const throwPearl = async (point: Vec3, why: string) => {
+    const item = bot.inventory.items().find((i) => i.name === "ender_pearl");
+    if (!item) return;
+    pearlBusy = true;
+    try {
+      bot.pathfinder.setGoal(null);
+      resetMotion();
+      await bot.equip(item, "hand");
+      const start = bot.entity.position.clone();
+      const dx = point.x - start.x;
+      const dz = point.z - start.z;
+      const d = Math.hypot(dx, dz);
+      const dy = point.y - start.y;
+      const pitch = pearl.aim(d, dy);
+      if (pitch === null || d < 2) return;
+      await bot.look(Math.atan2(-dx, -dz), pitch, true);
+      const landed = await new Promise<Vec3 | null>((resolve) => {
+        const onMove = () => {
+          clearTimeout(timer);
+          bot.off("forcedMove", onMove);
+          resolve(bot.entity.position.clone());
+        };
+        const timer = setTimeout(() => {
+          bot.off("forcedMove", onMove);
+          resolve(null);
+        }, 4000);
+        bot.on("forcedMove", onMove);
+        bot.activateItem();
+      });
+      if (!landed) return;
+      const fx = dx / d;
+      const fz = dz / d;
+      const rx = landed.x - start.x;
+      const rz = landed.z - start.z;
+      const forward = rx * fx + rz * fz;
+      const lateral = rz * fx - rx * fz;
+      // A teleport from elsewhere (death, an admin /tp) is not a pearl landing.
+      if (forward > 0.5 && forward < 70 && Math.abs(lateral) < 8) {
+        pearl.learn(bot.username, pitch, { d, dy }, { forward, lateral, dy: landed.y - start.y });
+        const err = Math.hypot(forward - d, lateral, landed.y - start.y - dy);
+        console.log(`[Learn] ${bot.username} pearl (${why}) aimed ${d.toFixed(1)} blocks, landed ${err.toFixed(1)} off target`);
+      }
+    } catch (err) {
+      console.warn(`[Hunt] ${bot.username} pearl failed: ${(err as Error).message}`);
+    } finally {
+      pearlBusy = false;
+      lastEquip = 0; // re-arm with the weapon on the next tick
+      if (win) win.start = 0; // a throw ends its decision window
+    }
+  };
+
   const stop = (why: string) => {
     if (!hunting) return;
-    lowerShield();
+    finish(null, null);
+    resetMotion();
     hunting = false;
-    followed = null;
     lastGoal = null;
     bot.pathfinder?.setGoal(null);
     console.log(`[Hunt] ${bot.username} stops hunting ${name}: ${why}`);
     brain.resume();
+  };
+
+  const follow = (ent: Entity, kind: "follow" | "retreat") => {
+    if (followed === ent && goalKind === kind) return;
+    followed = ent;
+    goalKind = kind;
+    const goal = kind === "retreat" ? new goals.GoalInvert(new goals.GoalFollow(ent, 12)) : new goals.GoalFollow(ent, 1);
+    bot.pathfinder.setGoal(goal, true);
+  };
+
+  const swing = (ent: Entity) => {
+    lowerShield();
+    lastSwing = Date.now();
+    bot.attack(ent);
+  };
+
+  /** Run the current tactic for one 250 ms tick. */
+  const act = (ent: Entity, tactic: Tactic, dist: number, now: number) => {
+    const ready = now - lastSwing >= swingMs(bot);
+    const inReach = dist <= 3.4;
+    if (inReach && tactic !== "retreat") void bot.lookAt(ent.position.offset(0, (ent.height ?? 1.8) * 0.85, 0), true);
+    switch (tactic) {
+      case "rush":
+        follow(ent, "follow");
+        if (inReach && ready) swing(ent);
+        break;
+      case "shield":
+        follow(ent, "follow");
+        if (inReach && ready) swing(ent);
+        else if (dist <= 4 && !blocking && shieldInOffhand(bot) && now - lastSwing > 100 && now - lastSwing < swingMs(bot) - 150) {
+          blocking = true;
+          bot.activateItem(true);
+        }
+        break;
+      case "wtap":
+        follow(ent, "follow");
+        if (inReach && ready) {
+          swing(ent);
+          // Release forward/sprint for a moment, then re-engage: the next hit
+          // starts a fresh sprint and deals sprint knockback again.
+          bot.pathfinder.setGoal(null);
+          bot.clearControlStates();
+          followed = null;
+        }
+        break;
+      case "crit":
+        follow(ent, "follow");
+        if (inReach && ready && bot.entity.onGround) {
+          bot.setControlState("jump", true);
+          const started = Date.now();
+          const onTick = () => {
+            const falling = bot.entity.velocity.y < -0.08;
+            if (falling || Date.now() - started > 700) {
+              bot.off("physicsTick", onTick);
+              bot.setControlState("jump", false);
+              if (falling && ent.isValid && ent.position.distanceTo(bot.entity.position) <= 3.6) swing(ent);
+            }
+          };
+          bot.on("physicsTick", onTick);
+          lastSwing = now; // hold the cooldown until the falling hit
+        }
+        break;
+      case "strafe":
+        if (followed) {
+          bot.pathfinder.setGoal(null);
+          followed = null;
+          goalKind = "";
+        }
+        void bot.lookAt(ent.position.offset(0, (ent.height ?? 1.8) * 0.85, 0), true);
+        bot.setControlState("forward", dist > 2.5);
+        bot.setControlState("sprint", dist > 2.5);
+        bot.setControlState(win?.side ?? "left", true);
+        if (inReach && ready) swing(ent);
+        break;
+      case "retreat":
+        follow(ent, "retreat");
+        break;
+      case "pearl_close":
+        if (!pearlBusy) void throwPearl(ent.position.clone(), "close the gap");
+        break;
+      case "pearl_escape":
+        if (!pearlBusy) {
+          const me = bot.entity.position;
+          const away = me.minus(ent.position);
+          const len = Math.hypot(away.x, away.z) || 1;
+          void throwPearl(new Vec3(me.x + (away.x / len) * 20, me.y, me.z + (away.z / len) * 20), "escape");
+        }
+        break;
+    }
   };
 
   const tick = () => {
@@ -210,38 +459,32 @@ export function startHunter(bot: Bot, brain: Pausable): void {
       moves.allowParkour = true;
       moves.canDig = bot.inventory.items().some((i) => i.name.endsWith("_pickaxe"));
       bot.pathfinder.setMovements(moves);
-      console.log(`[Hunt] ${bot.username} hunting ${name} (${target.distanceTo(bot.entity.position).toFixed(0)} blocks away)`);
+      lastHp = bot.health;
+      console.log(`[Hunt] ${bot.username} hunting ${name} (${target.distanceTo(bot.entity.position).toFixed(0)} blocks away, ${pearls()} pearls)`);
     }
+    if (pearlBusy) return;
     if (now - lastEquip > 5000) {
       lastEquip = now;
       equipBestWeapon(bot);
     }
 
     const dist = target.distanceTo(bot.entity.position);
-    if (ent) {
-      if (followed !== ent) {
-        followed = ent;
-        bot.pathfinder.setGoal(new goals.GoalFollow(ent, 1), true);
+    if (ent && dist <= 40) {
+      // Engaged: the learner picks a tactic for each decision window.
+      if (!win || now - win.start >= DECISION_MS) {
+        const state = observe(ent);
+        const prevTactic = win?.tactic;
+        finish(state, null);
+        const options = availableTactics(state, pearls(), shieldInOffhand(bot));
+        const { tactic, explored } = combat.choose(state, options);
+        if (tactic !== prevTactic) resetMotion();
+        win = { state, tactic, explored, start: now, dist0: state.dist, hits: 0, hpLost: 0, side: Math.random() < 0.5 ? "left" : "right" };
       }
-      if (dist <= 3.4) {
-        void bot.lookAt(ent.position.offset(0, (ent.height ?? 1.8) * 0.85, 0), true);
-        if (now - lastSwing >= swingMs(bot)) {
-          lowerShield(); // can't swing from behind a raised shield
-          lastSwing = now;
-          bot.attack(ent);
-        }
-      }
-      // Between swings in melee range, block with the shield. It needs a
-      // quarter second raised to take effect, which fits inside the cooldown.
-      if (dist <= 4 && !blocking && shieldInOffhand(bot) && now - lastSwing > 100 && now - lastSwing < swingMs(bot) - 150) {
-        blocking = true;
-        bot.activateItem(true);
-      } else if (dist > 4) {
-        lowerShield();
-      }
+      act(ent, win.tactic, dist, now);
     } else {
-      lowerShield();
-      followed = null;
+      // Out of sight: path to his tracked position, no learning.
+      finish(null, null);
+      if (followed || goalKind) resetMotion();
       if (!lastGoal || lastGoal.distanceTo(target) > 4 || !bot.pathfinder.isMoving()) {
         lastGoal = target.clone();
         bot.pathfinder.setGoal(new goals.GoalNear(target.x, target.y, target.z, 2));
@@ -249,9 +492,32 @@ export function startHunter(bot: Bot, brain: Pausable): void {
     }
     if (now - lastLog > 30_000) {
       lastLog = now;
-      console.log(`[Hunt] ${bot.username} → ${name}: ${dist.toFixed(0)} blocks${ent ? " (in sight)" : " (tracked)"}`);
+      console.log(`[Hunt] ${bot.username} -> ${name}: ${dist.toFixed(0)} blocks${ent ? " (in sight)" : " (tracked)"}`);
     }
   };
+
+  // ── Reward signals ──
+  bot.on("entityHurt", (e: Entity) => {
+    if (!win || e.username !== name) return;
+    if (Date.now() - lastSwing < 600 && e.position.distanceTo(bot.entity.position) <= 4.5) win.hits++;
+  });
+  bot.on("health", () => {
+    if (win && bot.health < lastHp) win.hpLost += lastHp - bot.health;
+    lastHp = bot.health;
+  });
+  bot.on("messagestr", (msg: string) => {
+    if (!win || !msg.startsWith(`${name} `)) return;
+    if (msg.endsWith(` ${bot.username}`) || msg.includes(` by ${bot.username}`)) finish(null, "kill");
+    else if (ALL_BOT_NAMES.some((b) => msg.includes(` by ${b}`))) finish(null, null, true);
+  });
+  bot.on("death", () => {
+    finish(null, "death");
+    followed = null;
+    goalKind = "";
+    lastGoal = null;
+    blocking = false;
+    pearlBusy = false;
+  });
 
   const iv = setInterval(() => {
     try {
@@ -260,10 +526,8 @@ export function startHunter(bot: Bot, brain: Pausable): void {
       console.warn(`[Hunt] ${bot.username} tick failed: ${(err as Error).message}`);
     }
   }, 250);
-  bot.once("end", () => clearInterval(iv));
-  bot.on("death", () => {
-    followed = null;
-    lastGoal = null;
-    blocking = false;
+  bot.once("end", () => {
+    clearInterval(iv);
+    finish(null, null);
   });
 }

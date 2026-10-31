@@ -8,6 +8,7 @@ import { fileURLToPath } from "url";
 import type { BotRoleConfig } from "../bot/role.js";
 import { getStashSummary } from "../skills/stash-ledger.js";
 import { opsSnapshot, startOpsPolling } from "../monitor/ops.js";
+import { learners } from "../bot/hunter.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -29,6 +30,12 @@ export function startDashboard(roster: BotRoleConfig[]) {
   startOpsPolling();
   app.get("/api/ops", async (_req, res) => {
     res.json(await opsSnapshot(roster.map((r) => r.username)));
+  });
+
+  // API endpoint: online learning state (combat Q-learning + pearl aim model)
+  app.get("/api/learning", (_req, res) => {
+    const { combat, pearl } = learners();
+    res.json({ squad: combat.squad, combat: combat.summary(), pearl: pearl.summary() });
   });
 
   // API endpoint: bot roster info (ports, names, roles)

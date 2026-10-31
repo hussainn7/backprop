@@ -4,14 +4,17 @@
 > LLM agents into an open-ended survival world and give them one long-horizon goal: beat
 > the game. It's built to run on a cost budget, on hardware from 2012.
 
-**What this is:** a self-hosted, zero-trust Minecraft deployment where five embodied AI
-agents (Atlas, Flora, Forge, Mason, Blade) live in a Paper 1.21.4 survival world next to
-human players. Each agent uses a **hierarchical control architecture**:
+**What this is:** a self-hosted, zero-trust Minecraft deployment where ten embodied AI
+agents in two squads (Atlas, Flora, Forge, Mason, Blade · Nova, Ivy, Anvil, Brick, Fang)
+live in a Paper 1.21.4 survival world next to human players, and **learn online from
+their own fights**. Each agent uses a **hierarchical control architecture**:
 
 | Layer | Latency | Driven by |
 |---|---|---|
 | Strategic planner | minutes | Claude Sonnet 5.5, periodic long-horizon replans |
 | Tactical policy | seconds | Claude Haiku 5.5, cached system prompt, low-effort inference |
+| Learned combat policy | ~1 s | tabular Q-learning over fighting tactics, trained online from every fight |
+| Learned pearl aim | per throw | projectile physics + recursive-least-squares correction, hindsight-relabelled |
 | Reflex / motor layer | ticks | deterministic Mineflayer skills (pathfinding, combat, crafting, eating) |
 
 **Engineering highlights**
@@ -23,11 +26,17 @@ human players. Each agent uses a **hierarchical control architecture**:
 - **Split-trust authentication.** There are two Velocity proxies: an online-mode edge for
   humans and a loopback-only offline-mode ingress for bots. A modern-forwarding shared
   secret means the backend can't be reached around either proxy.
+- **Online machine learning.** Bots learn *how* to fight from reward, not from prompts:
+  a shared Q-learning policy picks among sprint-hits, critical jump-hits, w-taps, shield
+  play, strafing, retreating and ender-pearl moves, and a learned aim model teaches them
+  to throw pearls accurately. Learning curves are live in Mission Control.
+  See [Machine learning](#machine-learning-bots-that-learn-to-fight).
 - **Ground-truth evaluation.** Progress is measured against a 10-stage milestone
   curriculum, read straight from the server's advancement and stats files and never from
   what the model says about itself. No hallucinated wins.
-- **Guardrails.** Agents can't run commands, can't attack players, and get no operator
-  privileges. Every network listener binds to localhost.
+- **Guardrails.** Agents can't run commands and get no operator privileges. They can't
+  attack players, with one opt-in exception (`HUNT_PLAYER`, below). Every network
+  listener binds to localhost.
 - **Ops.** Everything runs under `systemd --user` units, no root. There are zstd world
   snapshots every 6 h, a tunnel watchdog, and a Mission Control telemetry dashboard (TPS,
   RAM/CPU, spend, deaths, milestones).
@@ -36,6 +45,63 @@ Agent framework forked from
 [JesseRWeigel/minecraft-agent-swarm](https://github.com/JesseRWeigel/minecraft-agent-swarm)
 (MIT). The Anthropic adapter, budget system, guardrails, ops layer and infrastructure
 are mine; see [Changes](#changes-made-to-minecraft-agent-swarm).
+
+## Machine learning: bots that learn to fight
+
+The LLM layers decide *what* to do. Two small learners, trained online inside the agents
+process from the bots' own experience, decide *how* to fight. Nothing is pre-trained and
+nothing is scripted per tactic outcome: every number below is learned live on the server.
+The opponent is the owner (`HUNT_PLAYER`, `HUNT_MODE=primary`): while he plays survival,
+all ten bots hunt him, and every engagement is training data.
+
+### 1. Combat policy: tabular Q-learning (`src/learn/combat-learner.ts`)
+
+Each bot in sight of the target makes a decision every 1.2 s.
+
+| | |
+|---|---|
+| **State** (270) | distance bucket (≤3, 3–6, 6–12, 12–24, >24) × own health (≤6, ≤12, >12) × target shielding? × height difference (below, level, above) × allies near target (0, 1–2, 3+) |
+| **Actions** (8) | `rush` sprint-hit · `crit` jump and strike while falling (1.5× damage) · `wtap` sprint-hit then release for extra knockback · `shield` advance blocking, drop to swing · `strafe` circle-strafe · `retreat` · `pearl_close` pearl next to the target · `pearl_escape` pearl away when hurt |
+| **Reward** | +1 per hit landed (the target's hurt animation within 600 ms of our swing) − 0.5 per HP lost + distance closed / 5 + 10 for the kill (from the server's death message) − 10 for dying + 2 when a squadmate gets the kill |
+| **Update** | Q(s,a) ← Q(s,a) + α [r + γ·maxₐ′ Q(s′,a′) − Q(s,a)], α = 0.2, γ = 0.6 |
+| **Exploration** | ε-greedy, ε = max(0.05, 0.35·0.996ⁿ), untried tactics first |
+
+All five bots of a squad share one Q-table, so a lesson one bot learns is used by all
+five on their next decision. The table persists in `agent-swarm/logs/learning/combat-q-<squad>.json`
+and every decision (state, tactic, explored?, reward, hits, damage) is appended to
+`combat-experience-<squad>.jsonl` so learning can be audited or replayed offline.
+
+### 2. Ender-pearl aim: physics prior + learned correction (`src/learn/pearl-aim.ts`)
+
+1. **Physics prior.** A pearl leaves the eye at 1.5 blocks/tick, keeps 99 % of its
+   velocity per tick and falls 0.03 blocks/tick². Simulating the flight and inverting it
+   (scan + bisection; the range is not monotonic for targets above you) gives the low-arc
+   pitch for any target distance *d* and height difference *dy*.
+2. **Learned residual.** The real server differs from that model (tick order, the
+   thrower's own motion, leaves, spread). After each throw the bot knows the pitch it
+   used and where it really landed, so the throw is **relabelled in hindsight**: "to land
+   *there*, pitch *p* was right", while physics would have said *p*ₚₕᵧₛ(there). The
+   residual *p* − *p*ₚₕᵧₛ trains a **recursive-least-squares** regression on features
+   [1, d, dy, d², d·dy]. Aim = *p*ₚₕᵧₛ(target) + correction(target).
+   A throw whose hindsight label is implausible (more than 8° from physics) stopped on a
+   tree or wall mid-flight; it is recorded as *blocked* and never trained on.
+
+Every throw's landing error is stored (`pearl-aim-<squad>.json`). The unit test simulates
+a server whose pearls fly 3° low: the first throw misses by over a block, and within a
+few throws the model has learned the bias and the misses drop below 0.3 blocks.
+
+### Watching it learn
+
+Mission Control (:3010 alpha, :3011 bravo) → **Ops** → **Learning**: the mean reward per
+25 decisions (the learning curve), each tactic's uses, hits per use and mean reward, the
+greedy policy the squad has converged to at each distance, and the pearl landing error
+per throw. `[Learn]` lines in `logs\agents-<squad>.log` show individual decisions and
+scored outcomes. The two squads learn independently, which doubles as a replication:
+if both converge on the same tactics, that's evidence the result is real.
+
+**What it does not do (yet):** the state space is hand-designed and tabular; deep RL
+would need far more fights than one human opponent provides. Model-generated code is
+never executed for this; the learners only choose among fixed, reviewed behaviours.
 
 ---
 
