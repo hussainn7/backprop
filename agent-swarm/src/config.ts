@@ -1,4 +1,19 @@
 import "dotenv/config";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import dotenv from "dotenv";
+import { resolveProjectRoot } from "./project-root.js";
+
+// The API key lives outside the repo's .env, in <deployment>/config/secrets.env
+// (git-ignored). systemd loads it on the server host; elsewhere load it here.
+const secretsFile = path.join(
+  resolveProjectRoot(path.dirname(fileURLToPath(import.meta.url))),
+  "..",
+  "config",
+  "secrets.env",
+);
+if (fs.existsSync(secretsFile)) dotenv.config({ path: secretsFile, quiet: true });
 
 export type LLMProvider = "ollama" | "openai" | "anthropic";
 

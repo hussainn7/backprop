@@ -106,6 +106,26 @@ Restore a backup: `./mc stop`, move `server/world*` aside, `tar --zstd -xf backu
   `BOT_COMMAND_WHITELIST` in `agent-swarm/.env` (`!status`, `!come`, `!stay`, `!goal set …`).
 * Give yourself operator rights if you want them: `./mc console "op <YourName>"`.
 
+## Running the agents on another PC (remote mode)
+
+All bots share one Node.js thread, so the agents can run on a faster Windows PC while
+the world, proxies, tunnel and backups stay on the MacBook. Nothing new is exposed: the
+PC reaches the bot proxy and a read-only state mirror through an SSH tunnel to loopback.
+
+* **MacBook:** `scripts/server-mirror.mjs` (`mc-mirror.service`, copy in `deploy/systemd/`)
+  serves `GET http://127.0.0.1:25580/state`: level name, every advancements/stats file,
+  and TPS + player list from local RCON every 30 s. No secrets. With `AGENTS_FAILOVER=true`
+  it starts the MacBook's own `mc-agents` when the PC has not checked in for 5 min and
+  stops it when the PC returns (the PC waits for that before logging its bots in).
+* **PC:** `SERVER_MIRROR_URL=http://127.0.0.1:25580/state` in `agent-swarm/.env` makes the
+  agents pull `/state` every 60 s into `agent-swarm/server/` (a real directory there, a
+  symlink on the MacBook), so milestones and advancement readers work unchanged.
+  `MC_HOST=127.0.0.1`, `MC_PORT=25567` go through the tunnel. The key lives in
+  `config\secrets.env`, which `src/config.ts` loads if present.
+* `windows\copy-from-mac.ps1` copies `.env`, memory files and the spend ledger;
+  `windows\set-api-key.ps1` stores the key; `windows\start-agents.ps1` runs tunnel + agents;
+  `windows\install-autostart.ps1` starts them at login (Task Scheduler).
+
 ## API budget
 
 Settings live in `agent-swarm/.env`; the key lives in `config/secrets.env` (set it with

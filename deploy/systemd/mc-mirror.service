@@ -1,0 +1,19 @@
+# Read-only server-state mirror for the remote agents host (127.0.0.1:25580).
+# Install: cp deploy/systemd/mc-mirror.service ~/.config/systemd/user/ && systemctl --user daemon-reload
+#          systemctl --user enable --now mc-mirror
+[Unit]
+Description=Minecraft server-state mirror (advancements/stats/TPS) on 127.0.0.1:25580
+After=mc-paper.service
+
+[Service]
+WorkingDirectory=%h/minecraft-server
+# Start local mc-agents when the remote agents host has been silent >5 min; stop it when it returns.
+Environment=AGENTS_FAILOVER=true
+ExecStart=%h/minecraft-server/runtime/node/bin/node %h/minecraft-server/scripts/server-mirror.mjs
+Restart=always
+RestartSec=5
+StandardOutput=append:%h/minecraft-server/logs/mirror.log
+StandardError=append:%h/minecraft-server/logs/mirror.log
+
+[Install]
+WantedBy=default.target

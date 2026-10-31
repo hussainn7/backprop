@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import { resolveProjectRoot } from "../project-root.js";
 import { getLedger, budgetConfig } from "../llm/budget.js";
 import { offlineUUID, levelName } from "../bot/advancement-progress.js";
+import { mirrorUrl, mirrorServerInfo } from "./mirror-sync.js";
 
 const ROOT = resolveProjectRoot(path.dirname(fileURLToPath(import.meta.url)));
 const SERVER_DIR = path.join(ROOT, "server");
@@ -156,6 +157,8 @@ const require = createRequire(path.join(ROOT, "package.json"));
 let tpsCache: { tps: string; players: string; at: number } = { tps: "?", players: "?", at: 0 };
 
 async function refreshServer(): Promise<void> {
+  // Remote mode: no local RCON (and no password on this host); the mirror polls it for us.
+  if (mirrorUrl()) return;
   try {
     const props = fs.readFileSync(path.join(SERVER_DIR, "server.properties"), "utf8");
     const password = props.match(/^rcon\.password=(.*)$/m)?.[1]?.trim();
@@ -172,7 +175,19 @@ async function refreshServer(): Promise<void> {
   }
 }
 
+// No `ps` on Windows: report this agents process from its own counters (CPU % of one core).
+let lastCpu = { usage: process.cpuUsage(), at: Date.now() };
+function selfProcess(): { name: string; rssMb: number; cpu: number }[] {
+  const usage = process.cpuUsage();
+  const at = Date.now();
+  const busyUs = usage.user - lastCpu.usage.user + usage.system - lastCpu.usage.system;
+  const cpu = Math.round((busyUs / 10 / Math.max(1, at - lastCpu.at)) * 10) / 10;
+  lastCpu = { usage, at };
+  return [{ name: "agents", rssMb: Math.round(process.memoryUsage().rss / 1048576), cpu }];
+}
+
 function processes(): Promise<{ name: string; rssMb: number; cpu: number }[]> {
+  if (process.platform === "win32") return Promise.resolve(selfProcess());
   return new Promise((resolve) => {
     execFile("ps", ["-eo", "rss,pcpu,args", "--no-headers"], (err, out) => {
       if (err) return resolve([]);
@@ -210,7 +225,7 @@ export async function opsSnapshot(botNames: string[]) {
   const ledger = getLedger();
   return {
     at: new Date().toISOString(),
-    server: tpsCache,
+    server: mirrorUrl() ? mirrorServerInfo() : tpsCache,
     host: {
       load: os.loadavg().map((n) => n.toFixed(2)),
       memUsedMb: Math.round((os.totalmem() - os.freemem()) / 1048576),

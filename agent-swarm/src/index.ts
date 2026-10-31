@@ -214,6 +214,10 @@ async function main() {
     });
   }
 
+  // Remote mode: pull advancements/stats from the server host before bots read them.
+  const { startMirrorSync } = await import("./monitor/mirror-sync.js");
+  await startMirrorSync();
+
   if (!config.multiBot.enabled) {
     // Single bot mode — just Atlas
     await runBotLoop(BOT_ROSTER[0]);
