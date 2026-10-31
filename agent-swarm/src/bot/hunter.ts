@@ -323,6 +323,43 @@ export function startHunter(bot: Bot, brain: Pausable): void {
     }
   };
 
+  /**
+   * Plan a throw at a point: trace the low arc, then a high lob, through the
+   * real blocks. Null when both would clip a hillside, trunk or wall well short
+   * of the target, so the pearl tactic is not even offered in that situation.
+   */
+  const planThrow = (point: Vec3) => {
+    const start = bot.entity.position.clone();
+    const dx = point.x - start.x;
+    const dz = point.z - start.z;
+    const d = Math.hypot(dx, dz);
+    const dy = point.y - start.y;
+    if (d < 2) return null;
+    const fx0 = dx / d;
+    const fz0 = dz / d;
+    const clear = (p: number) => {
+      const path = trajectory(p, dy);
+      for (let i = 1; i < path.length; i++) {
+        const [ax, ay] = path[i - 1];
+        const [bx, by] = path[i];
+        const steps = Math.ceil(Math.hypot(bx - ax, by - ay) / 0.4);
+        for (let k = 1; k <= steps; k++) {
+          const fwd = ax + ((bx - ax) * k) / steps;
+          if (fwd > d - 2) return true; // reached the target area
+          const y = ay + ((by - ay) * k) / steps;
+          const b = bot.blockAt(new Vec3(start.x + fx0 * fwd, start.y + y, start.z + fz0 * fwd).floored());
+          if (b && b.boundingBox === "block") return false;
+        }
+      }
+      return true;
+    };
+    for (const arc of ["low", "high"] as const) {
+      const pitch = pearl.aim(d, dy, arc);
+      if (pitch !== null && clear(pitch)) return { start, dx, dz, d, dy, pitch, arc };
+    }
+    return null;
+  };
+
   /** Throw a pearl at a point using the learned aim; learn from where we land. */
   const throwPearl = async (point: Vec3, why: string) => {
     const item = bot.inventory.items().find((i) => i.name === "ender_pearl");
@@ -332,46 +369,12 @@ export function startHunter(bot: Bot, brain: Pausable): void {
       bot.pathfinder.setGoal(null);
       resetMotion();
       await bot.equip(item, "hand");
-      const start = bot.entity.position.clone();
-      const dx = point.x - start.x;
-      const dz = point.z - start.z;
-      const d = Math.hypot(dx, dz);
-      const dy = point.y - start.y;
-      if (d < 2) return;
-      // Trace each candidate arc through the real blocks; a pearl that would
-      // clip a hillside, trunk or wall well short of the target is not thrown.
-      const fx0 = dx / d;
-      const fz0 = dz / d;
-      const clear = (p: number) => {
-        const path = trajectory(p, dy);
-        for (let i = 1; i < path.length; i++) {
-          const [ax, ay] = path[i - 1];
-          const [bx, by] = path[i];
-          const steps = Math.ceil(Math.hypot(bx - ax, by - ay) / 0.4);
-          for (let k = 1; k <= steps; k++) {
-            const fwd = ax + ((bx - ax) * k) / steps;
-            if (fwd > d - 2) return true; // reached the target area
-            const y = ay + ((by - ay) * k) / steps;
-            const b = bot.blockAt(new Vec3(start.x + fx0 * fwd, start.y + y, start.z + fz0 * fwd).floored());
-            if (b && b.boundingBox === "block") return false;
-          }
-        }
-        return true;
-      };
-      let pitch: number | null = null;
-      let arc = "";
-      for (const a of ["low", "high"] as const) {
-        const p = pearl.aim(d, dy, a);
-        if (p !== null && clear(p)) {
-          pitch = p;
-          arc = a;
-          break;
-        }
-      }
-      if (pitch === null) {
-        console.log(`[Learn] ${bot.username} pearl (${why}) not thrown: no clear arc over the terrain to ${d.toFixed(0)} blocks`);
+      const plan = planThrow(point);
+      if (!plan) {
+        console.log(`[Learn] ${bot.username} pearl (${why}) not thrown: no clear arc over the terrain`);
         return;
       }
+      const { start, dx, dz, d, dy, pitch, arc } = plan;
       await bot.look(Math.atan2(-dx, -dz), pitch, true);
       const landed = await new Promise<Vec3 | null>((resolve) => {
         const onMove = () => {
@@ -543,7 +546,17 @@ export function startHunter(bot: Bot, brain: Pausable): void {
         const state = observe(ent);
         const prevTactic = win?.tactic;
         finish(state, null);
-        const options = availableTactics(state, pearls(), shieldInOffhand(bot));
+        // Only offer a pearl tactic when a clear arc exists right now.
+        const options = availableTactics(state, pearls(), shieldInOffhand(bot)).filter((t) => {
+          if (t === "pearl_close") return !!planThrow(ent.position);
+          if (t === "pearl_escape") {
+            const me = bot.entity.position;
+            const away = me.minus(ent.position);
+            const len = Math.hypot(away.x, away.z) || 1;
+            return !!planThrow(new Vec3(me.x + (away.x / len) * 20, me.y, me.z + (away.z / len) * 20));
+          }
+          return true;
+        });
         const { tactic, explored } = combat.choose(state, options);
         if (tactic !== prevTactic) resetMotion();
         win = { state, tactic, explored, start: now, dist0: state.dist, hits: 0, hpLost: 0, side: Math.random() < 0.5 ? "left" : "right" };
