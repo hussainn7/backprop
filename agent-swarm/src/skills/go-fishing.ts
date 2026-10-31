@@ -6,6 +6,7 @@ const { goals, Movements } = pkg;
 import mcDataLoader from "minecraft-data";
 import { baseMoves, explorerMoves, safeGoto, GoalNearXZAbove, collectNearbyDrops } from "../bot/navigation.js";
 import { placeCraftingTable } from "./craft-gear.js";
+import { archetypeOf } from "../bot/squad.js";
 
 const FISH_ATTEMPTS = 6;
 // 45s: a bite takes 5 to 30s under open sky and twice that under a roof.
@@ -81,7 +82,7 @@ export const goFishingSkill: Skill = {
           console.log(`[FishDebug] ${bot.username} rod withdraw: ${r1}`);
           if (!bot.inventory.items().some((i) => i.name === "fishing_rod") && held("string") < 2) {
             // The miner may fetch string from the deep chest (run 615).
-            const r2 = await withdrawStash(bot, STASH_POS, "string", 2, 110_000, bot.username === "Forge").catch(
+            const r2 = await withdrawStash(bot, STASH_POS, "string", 2, 110_000, archetypeOf(bot.username) === "Forge").catch(
               (e: Error) => e.message,
             );
             console.log(`[FishDebug] ${bot.username} string withdraw: ${r2} (string now ${held("string")})`);

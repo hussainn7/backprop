@@ -13,6 +13,7 @@ import { resolveProjectRoot } from "../project-root.js";
 import { getLedger, budgetConfig } from "../llm/budget.js";
 import { offlineUUID, levelName } from "../bot/advancement-progress.js";
 import { mirrorUrl, mirrorServerInfo } from "./mirror-sync.js";
+import { archetypeOf } from "../bot/squad.js";
 
 const ROOT = resolveProjectRoot(path.dirname(fileURLToPath(import.meta.url)));
 const SERVER_DIR = path.join(ROOT, "server");
@@ -282,6 +283,6 @@ export function milestoneGoalLine(botName: string, teamNames: string[]): string 
   const [progress, id, title, evidence] = goalCache.text.split("|");
   if (!id) return `CIVILIZATION GOAL: all 10 milestones verified (${progress}). Keep the settlement thriving.`;
   const hints = ROLE_HINTS[Number(id)] ?? {};
-  const hint = hints[botName] ?? hints.default ?? "";
+  const hint = hints[archetypeOf(botName)] ?? hints.default ?? "";
   return `CIVILIZATION GOAL (server-verified ${progress}): next milestone #${id} "${title}" — verified when: ${evidence}. YOUR PART: ${hint}.`;
 }

@@ -1,4 +1,4 @@
-# Start the agents (tunnel + swarm) hidden at login via Task Scheduler.
+# Start the server and agents (mc.ps1 start) hidden at login via Task Scheduler.
 #   .\install-autostart.ps1            install / update
 #   .\install-autostart.ps1 -Remove    uninstall
 param([switch]$Remove)
@@ -11,10 +11,9 @@ if ($Remove) {
 }
 
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument (
-    "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$(Join-Path $PSScriptRoot 'start-agents.ps1')`"")
+    "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$(Join-Path $PSScriptRoot 'mc.ps1')`" start")
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
-$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries `
-    -DontStopIfGoingOnBatteries -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
 Register-ScheduledTask -TaskName $Name -Action $action -Trigger $trigger -Settings $settings `
-    -Description 'Backprop Minecraft agents: SSH tunnel to the MacBook + agent swarm' -Force | Out-Null
+    -Description 'Backprop: local Paper server + AI agents' -Force | Out-Null
 Write-Host "Installed scheduled task $Name (runs at logon). Start now: Start-ScheduledTask $Name"

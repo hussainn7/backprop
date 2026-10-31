@@ -106,25 +106,32 @@ Restore a backup: `./mc stop`, move `server/world*` aside, `tar --zstd -xf backu
   `BOT_COMMAND_WHITELIST` in `agent-swarm/.env` (`!status`, `!come`, `!stay`, `!goal set …`).
 * Give yourself operator rights if you want them: `./mc console "op <YourName>"`.
 
-## Running the agents on another PC (remote mode)
+## Running everything on a Windows PC (local-only)
 
-All bots share one Node.js thread, so the agents can run on a faster Windows PC while
-the world, proxies, tunnel and backups stay on the MacBook. Nothing new is exposed: the
-PC reaches the bot proxy and a read-only state mirror through an SSH tunnel to loopback.
+Single-PC setup from `HANDOFF.md`: no proxies, playit or SSH. Paper binds `127.0.0.1:25565`
+with `online-mode=false` and the whitelist on, so nothing outside the PC can connect and
+offline mode is safe. Bots join Paper directly (`MC_PORT=25565`).
 
-* **MacBook:** `scripts/server-mirror.mjs` (`mc-mirror.service`, copy in `deploy/systemd/`)
-  serves `GET http://127.0.0.1:25580/state`: level name, every advancements/stats file,
-  and TPS + player list from local RCON every 30 s. No secrets. With `AGENTS_FAILOVER=true`
-  it starts the MacBook's own `mc-agents` when the PC has not checked in for 5 min and
-  stops it when the PC returns (the PC waits for that before logging its bots in).
-* **PC:** `SERVER_MIRROR_URL=http://127.0.0.1:25580/state` in `agent-swarm/.env` makes the
-  agents pull `/state` every 60 s into `agent-swarm/server/` (a real directory there, a
-  symlink on the MacBook), so milestones and advancement readers work unchanged.
-  `MC_HOST=127.0.0.1`, `MC_PORT=25567` go through the tunnel. The key lives in
-  `config\secrets.env`, which `src/config.ts` loads if present.
-* `windows\copy-from-mac.ps1` copies `.env`, memory files and the spend ledger;
-  `windows\set-api-key.ps1` stores the key; `windows\start-agents.ps1` runs tunnel + agents;
-  `windows\install-autostart.ps1` starts them at login (Task Scheduler).
+* Java 21 (`winget install EclipseAdoptium.Temurin.21.JDK`), Paper 1.21.4 build 232 as
+  `server\paper.jar`, Node >= 20 with `npm ci` in `agent-swarm`.
+* `agent-swarm\server` is a junction to `..\server` (`mklink /J`), like the MacBook symlink;
+  `git update-index --skip-worktree agent-swarm/server` keeps git quiet about it.
+* `agent-swarm\.env` from `.env.backprop.example`; the API key goes in `config\secrets.env`
+  via `windows\set-api-key.ps1` (hidden prompt). `src/config.ts` loads it.
+* `windows\mc.ps1 status|start|stop|restart [server|agents]|logs [server|agents]|console|budget`
+  is the `./mc` counterpart; logs go to `logs\server.log` and `logsgents.log`.
+  `windows\install-autostart.ps1` runs `mc.ps1 start` at login.
+* **Ten bots, two squads.** One Node thread cannot path-find for ten bots, so they run as
+  two processes (`SQUAD=alpha|bravo`, see `src/bot/squad.ts`): alpha = Atlas (leader),
+  Flora, Forge, Mason, Blade (Mission Control :3010); bravo = Nova (leader), Ivy, Anvil,
+  Brick, Fang (:3011), playing the same five roles. Members regroup when more than
+  `SQUAD_RADIUS` blocks from their leader and see the leader's latest plan in their prompts.
+  Each squad has its own spend ledger (`logs/api-usage[-bravo].json`) and caps.
+* **Speedrun + hunt.** `TEAM_GOAL` carries the speedrun route; `HUNT_PLAYER=SirFinnn` lets
+  bots attack that one player, only while he is in survival mode. Hostile sounds (a fusing
+  creeper, a skeleton out of sight) trigger the reflex layer immediately.
+* Remote-agents mode (agents on one machine, server on another) is still available:
+  `scripts/server-mirror.mjs` + `SERVER_MIRROR_URL`, see `deploy/systemd/mc-mirror.service`.
 
 ## API budget
 

@@ -25,7 +25,7 @@ import { keepsPiglinPassport, isGoldPiece } from "./gold-passport.js";
 import { queryStrategic, queryReactive, queryCritic, chatWithLLM, type LLMMessage, type LLMDecision } from "../llm/index.js";
 import type { RoleContext } from "../llm/prompts.js";
 import { getWorldContext, isHostile } from "./perception.js";
-import { executeAction, FOOD_PRIORITY } from "./actions.js";
+import { executeAction, FOOD_PRIORITY, attackPlayer } from "./actions.js";
 import {
   digOutIfStuck,
   escapeWaterIfDrowning,
@@ -47,6 +47,17 @@ import { generateSpeech } from "../stream/tts.js";
 import { filterContent, filterChatMessage, filterViewerMessage } from "../safety/filter.js";
 import { abortActiveSkill, isSkillRunning, getActiveSkillName, takeSkillOutcome } from "../skills/executor.js";
 import { milestoneGoalLine } from "../monitor/ops.js";
+import {
+  archetypeOf,
+  squadName,
+  isLeader,
+  leaderBot,
+  leaderName,
+  leaderOrderLine,
+  setLeaderOrder,
+  huntTargetEntity,
+  SQUAD_RADIUS,
+} from "./squad.js";
 import { stashCount, ledgerKnown } from "../skills/stash-ledger.js";
 import { handsBusy } from "../skills/fluid.js";
 import { skillRegistry } from "../skills/registry.js";
@@ -393,7 +404,7 @@ export class BotBrain {
    */
   private waxWaiting(): boolean {
     if (Date.now() < this.waxWaitingUntil) return true;
-    if (this.bot.username !== "Forge" || !this.roleConfig.allowedSkills.includes("wax_copper")) return false;
+    if (archetypeOf(this.bot.username) !== "Forge" || !this.roleConfig.allowedSkills.includes("wax_copper")) return false;
     const names = new Set(this.bot.inventory.items().map((i) => i.name));
     if (!names.has("copper_block") || !names.has("shears")) return false;
     const earned = readTeamEarned(BOT_ROSTER.map((b) => b.name));
@@ -415,7 +426,7 @@ export class BotBrain {
 
   // Configuration
   private IDLE_INTERVAL_MS: number;
-  private HOSTILE_CHECK_MS = 2000;
+  private HOSTILE_CHECK_MS = 1000;
   private REACTIVE_COOLDOWN_MS = 3000;
   private STRATEGIC_COOLDOWN_MS = 8000;
   private CRITIC_ENABLED = config.bot.criticEnabled;
@@ -685,6 +696,11 @@ export class BotBrain {
 
     // 3. Health/hunger monitoring via mineflayer events
     this.bot.on("health", () => this.checkVitals());
+
+    // 3b. Hearing: hostile sounds (a creeper fusing behind the bot, a skeleton
+    // drawing its bow out of sight) trigger the reactive layer immediately
+    // instead of waiting for the next hostile scan.
+    this.bot.on("soundEffectHeard", (name: string, pos: Vec3) => this.onSoundHeard(name, pos));
 
     // 4. Entity hurt — react when bot takes damage
     this.bot.on("entityHurt", (entity: Entity) => {
@@ -976,6 +992,82 @@ export class BotBrain {
       .map((i) => i.name)
       .sort((a, b) => order.findIndex((t) => a.startsWith(t)) - order.findIndex((t) => b.startsWith(t)));
     return weapons[0] ?? null;
+  }
+
+  private lastSoundReactMs = 0;
+
+  /** React to hostile sounds; a fusing creeper or lit TNT nearby means run now. */
+  private onSoundHeard(name: string, pos: Vec3): void {
+    if (this.stopped || this.paused) return;
+    const me = this.bot.entity?.position;
+    if (!me || !pos) return;
+    const dist = pos.distanceTo(me);
+    if (dist > 16) return;
+    const now = Date.now();
+    if (/creeper[._]primed|tnt[._]primed/.test(name) && dist < 8) {
+      if (now - this.lastSoundReactMs < 1500) return;
+      this.lastSoundReactMs = now;
+      this.log.info("Brain", `HEARD ${name} ${dist.toFixed(0)} blocks away — fleeing`);
+      if (isSkillRunning(this.bot)) abortActiveSkill(this.bot);
+      void this.executeDecision({
+        thought: `Heard ${name.replace(/^minecraft:/, "")} ${dist.toFixed(0)} blocks away — getting clear of the blast.`,
+        action: "flee",
+        params: {},
+        metadata: { requestId: null, origin: "deterministic" },
+      });
+      return;
+    }
+    const HOSTILE_SOUND =
+      /zombie|skeleton|stray|bogged|spider|witch|pillager|vindicator|evoker|ravager|drowned|husk|phantom|blaze|ghast|piglin_brute|hoglin|warden|enderman[._](scream|stare)|arrow[._]shoot|crossbow[._]shoot/;
+    if (!HOSTILE_SOUND.test(name) || now - this.lastSoundReactMs < 5000) return;
+    const hostiles = Object.values(this.bot.entities).filter(
+      (e) => e !== this.bot.entity && !!e.position && isHostile(e) && e.position.distanceTo(me) < 16,
+    );
+    if (!hostiles.length) return;
+    this.lastSoundReactMs = now;
+    this.pushEvent({ type: "reactive", priority: 1, data: { reason: "hostile_nearby", entities: hostiles }, timestamp: now });
+  }
+
+  private lastHuntMs = 0;
+
+  /**
+   * Secondary goal (HUNT_PLAYER): attack the owner while he is in survival,
+   * close, reachable, and the bot is armed and healthy. Never chases him far.
+   */
+  private async huntOverride(): Promise<boolean> {
+    const target = huntTargetEntity(this.bot);
+    const me = this.bot.entity?.position;
+    if (!target || !me || isSkillRunning(this.bot)) return false;
+    if (Date.now() - this.lastHuntMs < 15_000) return false;
+    const dist = target.position.distanceTo(me);
+    if (dist > 24 || Math.abs(target.position.y - me.y) > 4) return false;
+    if (!this.carriedWeapon() || this.bot.health < 12) return false;
+    this.lastHuntMs = Date.now();
+    this.log.info("Brain", `HUNT: ${target.username} is in survival ${dist.toFixed(0)} blocks away — attacking`);
+    const result = await attackPlayer(this.bot, target);
+    this.lastAction = "hunt_player";
+    this.lastResult = result;
+    return true;
+  }
+
+  private lastRegroupMs = 0;
+
+  /** Squad members drifting more than SQUAD_RADIUS from their leader walk back to it. */
+  private async regroupOverride(): Promise<boolean> {
+    if (isLeader(this.bot.username) || isSkillRunning(this.bot)) return false;
+    if (Date.now() - this.lastRegroupMs < 20_000) return false;
+    const leader = leaderBot();
+    const lp = leader?.entity?.position;
+    const me = this.bot.entity?.position;
+    if (!leader || !lp || !me || leader.game.dimension !== this.bot.game.dimension) return false;
+    const dist = lp.distanceTo(me);
+    if (dist <= SQUAD_RADIUS || this.hostileWithin(12)) return false;
+    this.lastRegroupMs = Date.now();
+    this.log.info("Brain", `REGROUP: ${dist.toFixed(0)} blocks from ${leaderName()} — moving back to the squad`);
+    await safeGoto(this.bot, new navGoals.GoalNear(lp.x, lp.y, lp.z, 8), 45_000).catch(() => {});
+    this.lastAction = "regroup";
+    this.lastResult = `Regrouped toward ${leaderName()} (was ${dist.toFixed(0)} blocks away).`;
+    return true;
   }
 
   /**
@@ -1452,6 +1544,10 @@ export class BotBrain {
     // Safety overrides first
     if (await this.runSafetyOverrides()) return;
 
+    // Squad play: the secondary hunt goal, then staying with the leader.
+    if (await this.huntOverride()) return;
+    if (await this.regroupOverride()) return;
+
     // Heal first, ahead of every other override. Run 707: this block sat
     // behind the farm, Nether-return and stranded rules, and Mason ran those
     // for two hours at a quarter heart with bread aboard. Run 704: Mason stood at 6 health and 9 hunger at the
@@ -1785,7 +1881,7 @@ export class BotBrain {
     // back to base, from where the frontier ferry can carry him east again.
     const HIVE_XZ = nearestNest(this.bot.entity.position.x, this.bot.entity.position.z);
     const forgeHoldingEast =
-      this.bot.username === "Forge" &&
+      archetypeOf(this.bot.username) === "Forge" &&
       Math.hypot(this.bot.entity.position.x - HIVE_XZ.x, this.bot.entity.position.z - HIVE_XZ.z) < 200;
     const inOverworld = /overworld/.test(String(this.bot.game.dimension));
     if (
@@ -1793,8 +1889,8 @@ export class BotBrain {
       !isSkillRunning(this.bot) &&
       this.roleConfig.stashPos &&
       inOverworld &&
-      this.bot.username !== "Flora" &&
-      this.bot.username !== "Atlas" &&
+      archetypeOf(this.bot.username) !== "Flora" &&
+      archetypeOf(this.bot.username) !== "Atlas" &&
       // Runs 604 to 606: a pickless Forge at 0 hunger spent three hours on
       // the eastern ground (a mountain pocket at y=150, then a cave at y=15)
       // because the hive hold kept him from walking home, where the stash
@@ -2207,7 +2303,7 @@ export class BotBrain {
     if (
       config.bot.allowStrategyOverrides &&
       !isSkillRunning(this.bot) &&
-      this.bot.username === "Forge" &&
+      archetypeOf(this.bot.username) === "Forge" &&
       this.roleConfig.allowedSkills.includes("wax_copper") &&
       /overworld/.test(String(this.bot.game.dimension))
     ) {
@@ -2253,7 +2349,7 @@ export class BotBrain {
     if (
       config.bot.allowStrategyOverrides &&
       !isSkillRunning(this.bot) &&
-      this.bot.username === "Forge" &&
+      archetypeOf(this.bot.username) === "Forge" &&
       this.roleConfig.allowedSkills.includes("wax_off") &&
       /overworld/.test(String(this.bot.game.dimension))
     ) {
@@ -2287,7 +2383,7 @@ export class BotBrain {
     if (
       config.bot.allowStrategyOverrides &&
       !isSkillRunning(this.bot) &&
-      this.bot.username === "Forge" &&
+      archetypeOf(this.bot.username) === "Forge" &&
       this.roleConfig.allowedSkills.includes("harvest_honey") &&
       /overworld/.test(String(this.bot.game.dimension))
     ) {
@@ -2342,7 +2438,7 @@ export class BotBrain {
     if (
       config.bot.allowStrategyOverrides &&
       !isSkillRunning(this.bot) &&
-      this.bot.username !== "Mason" &&
+      archetypeOf(this.bot.username) !== "Mason" &&
       this.roleConfig.stashPos &&
       /overworld/.test(String(this.bot.game.dimension)) &&
       Date.now() - this.lastGoldHomeMs > 300_000
@@ -2409,7 +2505,7 @@ export class BotBrain {
     if (
       config.bot.allowStrategyOverrides &&
       !isSkillRunning(this.bot) &&
-      this.bot.username === "Forge" &&
+      archetypeOf(this.bot.username) === "Forge" &&
       this.roleConfig.allowedSkills.includes("mine_frontier") &&
       /overworld/.test(String(this.bot.game.dimension))
     ) {
@@ -2739,7 +2835,7 @@ export class BotBrain {
     if (
       config.bot.allowStrategyOverrides &&
       !isSkillRunning(this.bot) &&
-      (this.bot.username === "Mason" || this.bot.username === "Forge") &&
+      (archetypeOf(this.bot.username) === "Mason" || archetypeOf(this.bot.username) === "Forge") &&
       this.roleConfig.allowedSkills.includes("loot_bastion")
     ) {
       const earnedBastion = readTeamEarned(BOT_ROSTER.map((b) => b.name));
@@ -2812,7 +2908,7 @@ export class BotBrain {
     // disk around the village portal is exhausted — no fortress in reach, all
     // nether biomes already earned — so his 7-deaths/hr there bought nothing.
     // Mason keeps one lottery ticket + one deflect participant in the Nether.
-    const isFortressHunter = this.bot.username === "Mason";
+    const isFortressHunter = archetypeOf(this.bot.username) === "Mason";
     if (
       config.bot.allowStrategyOverrides &&
       !isSkillRunning(this.bot) &&
@@ -3366,7 +3462,7 @@ export class BotBrain {
     if (
       config.bot.allowStrategyOverrides &&
       !isSkillRunning(this.bot) &&
-      this.bot.username === "Forge" &&
+      archetypeOf(this.bot.username) === "Forge" &&
       this.roleConfig.allowedSkills.includes("trade_with_villager") &&
       /overworld/.test(String(this.bot.game.dimension))
     ) {
@@ -3410,7 +3506,7 @@ export class BotBrain {
     if (
       config.bot.allowStrategyOverrides &&
       !isSkillRunning(this.bot) &&
-      (this.bot.username === "Flora" || this.bot.username === "Atlas") &&
+      (archetypeOf(this.bot.username) === "Flora" || archetypeOf(this.bot.username) === "Atlas") &&
       /overworld/.test(String(this.bot.game.dimension))
     ) {
       const cooledRoam = Date.now() - this.lastBiomeRoamMs > 240_000;
@@ -3560,12 +3656,12 @@ export class BotBrain {
         // dying to village-clutter pathfinding ("Stuck" four straight
         // firings), while the point-blank give rail is custody-verified and
         // walks three blocks. Blade is the whole reason the fund exists.
-        const blade = this.bot.players["Blade"]?.entity;
-        if (blade && this.bot.username !== "Blade" && this.bot.entity.position.distanceTo(blade.position) < 24) {
+        const blade = this.bot.players[squadName("Blade")]?.entity;
+        if (blade && archetypeOf(this.bot.username) !== "Blade" && this.bot.entity.position.distanceTo(blade.position) < 24) {
           this.log.info("Brain", `OVERRIDE: smith holding ${goldAboard} gold — handing it straight to Blade`);
           this.events.onThought("Blade! Payroll for the piglin fund. Catch.");
           const result = await this.executeActionUnlessPaused("give_item", {
-            to: "Blade",
+            to: squadName("Blade"),
             item: "gold_ingot",
             count: 9,
           });
@@ -3630,7 +3726,7 @@ export class BotBrain {
     if (
       config.bot.allowStrategyOverrides &&
       !isSkillRunning(this.bot) &&
-      (this.bot.username === "Blade" || swordAboard)
+      (archetypeOf(this.bot.username) === "Blade" || swordAboard)
     ) {
       const earnedAim = readTeamEarned(BOT_ROSTER.map((b) => b.name));
       const aimDone = earnedAim.has("adventure/shoot_arrow") || earnedAim.has("minecraft:adventure/shoot_arrow");
@@ -3654,7 +3750,7 @@ export class BotBrain {
     // Archery reflex (Blade) — once string exists, everything else for Take
     // Aim is banked: 63 arrows, sticks by the stack, a table at the stash.
     // Fires near the stash (crafting range) or whenever a bow is in hand.
-    if (config.bot.allowStrategyOverrides && !isSkillRunning(this.bot) && this.bot.username === "Blade") {
+    if (config.bot.allowStrategyOverrides && !isSkillRunning(this.bot) && archetypeOf(this.bot.username) === "Blade") {
       const earnedAim2 = readTeamEarned(BOT_ROSTER.map((b) => b.name));
       const aimDone2 = earnedAim2.has("adventure/shoot_arrow") || earnedAim2.has("minecraft:adventure/shoot_arrow");
       const cooledAim = Date.now() - this.lastAimMs > 600_000;
@@ -3721,7 +3817,7 @@ export class BotBrain {
     // piglin advancement waiting to happen. Daytime departures only (the
     // walk to the portal at night is how bots die), from the stash where the
     // gold and crafting table live.
-    if (config.bot.allowStrategyOverrides && !isSkillRunning(this.bot) && this.bot.username === "Blade") {
+    if (config.bot.allowStrategyOverrides && !isSkillRunning(this.bot) && archetypeOf(this.bot.username) === "Blade") {
       const earnedShiny = readTeamEarned(BOT_ROSTER.map((b) => b.name));
       const shinyDone =
         earnedShiny.has("nether/distract_piglin") || earnedShiny.has("minecraft:nether/distract_piglin");
@@ -3750,7 +3846,7 @@ export class BotBrain {
     if (
       config.bot.allowStrategyOverrides &&
       !isSkillRunning(this.bot) &&
-      this.bot.username === "Flora" &&
+      archetypeOf(this.bot.username) === "Flora" &&
       this.roleConfig.stashPos
     ) {
       const earnedBed = readTeamEarned(BOT_ROSTER.map((b) => b.name));
@@ -3874,7 +3970,7 @@ export class BotBrain {
         if (
           config.bot.allowStrategyOverrides &&
           !isSkillRunning(this.bot) &&
-          this.bot.username !== "Mason" &&
+          archetypeOf(this.bot.username) !== "Mason" &&
           this.roleConfig.stashPos &&
           Date.now() - this.lastNetherGoldBankMs > 600_000
         ) {
@@ -4096,7 +4192,7 @@ export class BotBrain {
       // Every role may fish now (run 563: 17 deaths, four bots at 0 food, nine
       // empty hunts). The Fishy Business chase stays Flora's; the others go
       // to the water only when starving.
-      const chasesFishy = !fished && this.bot.username === "Flora";
+      const chasesFishy = !fished && archetypeOf(this.bot.username) === "Flora";
       // No rod and no way to make one means no trip: run 568 sent rodless
       // bots to the stash nine times for string that sat 66 blocks down, two
       // minutes each. Rods wear out after 64 casts, so this gate matters.
@@ -4112,7 +4208,7 @@ export class BotBrain {
         stashCount("string", stashY) >= 2 ||
         // Run 615: two string sit 66 blocks under the stash; the miner can
         // reach that chest (deep withdraw), nobody else should try.
-        (this.bot.username === "Forge" && stashCount("string") >= 2);
+        (archetypeOf(this.bot.username) === "Forge" && stashCount("string") >= 2);
       if ((chasesFishy || starving) && cooled && !canRig) {
         this.lastFishOverrideMs = Date.now();
         this.log.info(
@@ -4549,7 +4645,8 @@ export class BotBrain {
     }
 
     const goalLine = milestoneGoalLine(this.roleConfig.username, BOT_ROSTER.map((r) => r.username));
-    const context = goalLine ? `${goalLine}\n${this.buildContext()}` : this.buildContext();
+    const squadLine = leaderOrderLine(this.bot.username);
+    const context = [goalLine, squadLine, this.buildContext()].filter(Boolean).join("\n");
     const memoryCtx = this.memStore.getMemoryContext();
     // Run 619: "eat" was blocked for ten minutes after "No food in
     // inventory", and the model still picked it 102 times in an hour (a
@@ -4569,6 +4666,10 @@ export class BotBrain {
     };
 
     const decision = await queryStrategic(context, this.recentHistory, memoryCtx, role);
+    if (isLeader(this.bot.username) && decision.thought) {
+      const skill = typeof decision.params?.skill === "string" ? ` ${decision.params.skill}` : "";
+      setLeaderOrder(`${decision.thought} (doing: ${decision.action}${skill})`);
+    }
     const outcome = await this.executeDecision(decision);
 
     // Exact provider messages and raw responses live in episode-events-v1.

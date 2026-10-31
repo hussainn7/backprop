@@ -77,8 +77,11 @@ export interface Ledger {
   updatedAt: string;
 }
 
-const LEDGER_FILE = projectPath("logs", "api-usage.json");
-const CALL_LOG = projectPath("logs", "api-calls.jsonl");
+// Each squad process keeps its own ledger (two processes cannot share one
+// in-memory ledger); its caps apply to that squad. Alpha keeps the old names.
+const SQUAD_SUFFIX = process.env.SQUAD && process.env.SQUAD !== "alpha" ? `-${process.env.SQUAD}` : "";
+const LEDGER_FILE = projectPath("logs", `api-usage${SQUAD_SUFFIX}.json`);
+const CALL_LOG = projectPath("logs", `api-calls${SQUAD_SUFFIX}.jsonl`);
 
 function localDay(d = new Date()): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;

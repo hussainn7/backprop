@@ -235,5 +235,5 @@ test("gold goes home before the ferry and the dive while the trip is short", () 
   assert.match(block, /goldHeldHome >= 1 && !rodDone && bankedGold < 4/, "any gold counts while the trip is short");
   assert.match(block, /walking it home from/, "far from the stash it walks home");
   assert.match(block, /banking \$\{goldHeldHome\} gold for the Nether trip/, "at the stash it banks");
-  assert.match(block, /this\.bot\.username !== "Mason"/, "the crosser keeps his gold");
+  assert.match(block, /archetypeOf\(this\.bot\.username\) !== "Mason"/, "the crosser keeps his gold");
 });

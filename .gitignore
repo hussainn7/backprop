@@ -26,6 +26,7 @@ logs/
 *.jar
 *.tar.zst
 server/world*/
+server/ai-world*/
 server/firstboot.log
 agent-swarm/unsloth_compiled_cache/
 .agent-swarm-upstream.git/

@@ -1,4 +1,5 @@
 import "dotenv/config"; // BASE_POS etc. are read at module load
+import { SQUAD, squadName, type Archetype } from "./squad.js";
 /**
  * Static role definitions for every bot in the swarm.
  *
@@ -430,4 +431,23 @@ export const BLADE_CONFIG: BotRoleConfig = {
 
 /** All bot configs in startup order. */
 /** Ordered startup roster; adding a role config elsewhere does not start it. */
-export const BOT_ROSTER: BotRoleConfig[] = [ATLAS_CONFIG, FLORA_CONFIG, FORGE_CONFIG, MASON_CONFIG, BLADE_CONFIG];
+const ALPHA_ROSTER: BotRoleConfig[] = [ATLAS_CONFIG, FLORA_CONFIG, FORGE_CONFIG, MASON_CONFIG, BLADE_CONFIG];
+
+/**
+ * Squad bravo plays the same five roles under its own names, memory files and
+ * ports (+20), so both squads can run side by side in two processes.
+ */
+function bravoRole(c: BotRoleConfig): BotRoleConfig {
+  const name = squadName(c.name as Archetype, "bravo");
+  return {
+    ...c,
+    name,
+    username: name,
+    viewerPort: c.viewerPort + 20,
+    overlayPort: c.overlayPort + 20,
+    memoryFile: `memory-${name.toLowerCase()}.json`,
+    personality: c.personality.replaceAll(c.name, name),
+  };
+}
+
+export const BOT_ROSTER: BotRoleConfig[] = SQUAD === "bravo" ? ALPHA_ROSTER.map(bravoRole) : ALPHA_ROSTER;

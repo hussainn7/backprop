@@ -1866,6 +1866,36 @@ async function huntAnimal(bot: Bot, animal: import("prismarine-entity").Entity):
     : `Hunted ${name} (drops collected — check inventory).`;
 }
 
+/**
+ * Fight the HUNT_PLAYER owner for up to 8 s (the attack guard in bot/index.ts
+ * lets only that player, in survival mode, be hit). Ends early if he dies,
+ * logs out, or gets more than 24 blocks away.
+ */
+export async function attackPlayer(bot: Bot, target: NonNullable<Bot["entity"]>): Promise<string> {
+  const melee =
+    bot.inventory.items().find((i) => i.name.endsWith("_sword")) ??
+    bot.inventory.items().find((i) => i.name.endsWith("_axe"));
+  if (melee && bot.heldItem?.name !== melee.name) await bot.equip(melee, "hand").catch(() => {});
+  const name = target.username ?? "player";
+  const swordpvp = (bot as any).swordpvp;
+  const start = Date.now();
+  if (swordpvp) swordpvp.attack(target);
+  await new Promise<void>((resolve) => {
+    const tick = setInterval(() => {
+      const me = bot.entity?.position;
+      const over = Date.now() - start >= 8000 || !target.isValid || !me || target.position.distanceTo(me) > 24;
+      if (!swordpvp && me && target.isValid && target.position.distanceTo(me) < 3.5) bot.attack(target);
+      if (over) {
+        clearInterval(tick);
+        if (swordpvp) swordpvp.stop();
+        resolve();
+      }
+    }, 250);
+  });
+  const secs = ((Date.now() - start) / 1000).toFixed(1);
+  return target.isValid ? `Fought ${name} for ${secs}s; he is still standing.` : `Fought ${name} for ${secs}s; he went down or left.`;
+}
+
 async function flee(bot: Bot): Promise<string> {
   const myPos = bot.entity?.position;
   if (!myPos) return "Can't flee right now — still respawning.";

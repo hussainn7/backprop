@@ -70,8 +70,21 @@ export function readEarned(botName: string, serverDir = "server"): Set<string> {
   return earned;
 }
 
+/**
+ * The brain asks for the team set from ~30 places per decision; re-reading and
+ * parsing five 45KB files each time was 16% of the agents' CPU on Windows
+ * (synchronous reads are slow there). Paper only rewrites them on autosave and
+ * logout, minutes apart, so a few seconds of staleness changes nothing.
+ */
+const TEAM_CACHE_MS = 5_000;
+const teamCache = new Map<string, { at: number; earned: Set<string> }>();
+
 export function readTeamEarned(botNames: string[], serverDir = "server"): Set<string> {
+  const key = `${serverDir}\0${botNames.join(",")}`;
+  const hit = teamCache.get(key);
+  if (hit && Date.now() - hit.at < TEAM_CACHE_MS) return new Set(hit.earned);
   const union = new Set<string>();
   for (const name of botNames) for (const id of readEarned(name, serverDir)) union.add(id);
-  return union;
+  teamCache.set(key, { at: Date.now(), earned: union });
+  return new Set(union);
 }

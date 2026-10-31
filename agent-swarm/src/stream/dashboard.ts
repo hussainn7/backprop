@@ -11,7 +11,7 @@ import { opsSnapshot, startOpsPolling } from "../monitor/ops.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-const DASHBOARD_PORT = 3010;
+const DASHBOARD_PORT = Number(process.env.DASHBOARD_PORT || 3010);
 
 export function startDashboard(roster: BotRoleConfig[]) {
   const app = express();

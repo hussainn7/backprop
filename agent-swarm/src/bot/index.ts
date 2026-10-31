@@ -32,6 +32,7 @@ import { recordDeath, startScoreboard } from "./scoreboard.js";
 import { createFallTracker, isFallDeath } from "./fall-tracker.js";
 import { shouldFleeOnRespawn } from "./respawn-safety.js";
 import { isHostile } from "./perception.js";
+import { ALL_BOT_NAMES, huntPlayer, registerSquadBot } from "./squad.js";
 
 // Re-export types used by src/index.ts
 export type { ChatMessage, BrainEvents as BotEvents };
@@ -109,6 +110,7 @@ export async function createBot(events: BrainEvents, roleConfig: BotRoleConfig =
     auth: config.mc.auth,
     checkTimeoutInterval: 120_000,
   });
+  bot.once("login", () => registerSquadBot(bot));
 
   registerBotMemory(bot, memStore);
 
@@ -129,11 +131,13 @@ export async function createBot(events: BrainEvents, roleConfig: BotRoleConfig =
     };
 
     // Human-safety guard: bots never hit players (humans or each other) unless
-    // BOTS_MAY_ATTACK_PLAYERS=true is set explicitly.
+    // BOTS_MAY_ATTACK_PLAYERS=true is set explicitly. The one exception is the
+    // HUNT_PLAYER game: that single player, and only while in survival mode.
     if (process.env.BOTS_MAY_ATTACK_PLAYERS !== "true") {
       const rawAttack = bot.attack.bind(bot);
       bot.attack = ((target: Parameters<typeof rawAttack>[0], ...rest: unknown[]) => {
-        if (target?.type === "player") {
+        const hunted = !!huntPlayer() && target?.username === huntPlayer() && bot.players[huntPlayer()]?.gamemode === 0;
+        if (target?.type === "player" && !hunted) {
           console.warn(`[Safety] ${roleConfig.name} refused to attack player ${target.username ?? "?"}`);
           return;
         }
@@ -475,7 +479,7 @@ export async function createBot(events: BrainEvents, roleConfig: BotRoleConfig =
   // In-game chat — ignore self. Other bots are heard ONLY when they address this
   // bot by name, and at most once per sender per cooldown window. This enables
   // team coordination ("Mason! Craft a chest!") without runaway feedback loops.
-  const BOT_USERNAMES = new Set(["Atlas", "Flora", "Forge", "Mason", "Blade"]);
+  const BOT_USERNAMES = new Set(ALL_BOT_NAMES);
   const BOT_CHAT_COOLDOWN_MS = 45_000;
   const lastBotChatHeard = new Map<string, number>();
   bot.on("chat", async (username, message) => {

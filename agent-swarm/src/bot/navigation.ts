@@ -4,6 +4,7 @@ import type { Bot } from "mineflayer";
 import pkg from "mineflayer-pathfinder";
 import type { Move } from "mineflayer-pathfinder";
 import { chooseDrownEscape } from "./drown-escape.js";
+import { archetypeOf } from "./squad.js";
 const { goals, Movements } = pkg;
 
 /**
@@ -251,7 +252,7 @@ export function baseMoves(bot: Bot): InstanceType<typeof Movements> {
   // can still fall, and mining skills run on Forge, who is exempt; the
   // Nether keeps its own depths.
   const inOverworld = /overworld/.test(String(bot.game?.dimension ?? "overworld"));
-  if (bot.username !== "Forge" && inOverworld) {
+  if (archetypeOf(bot.username) !== "Forge" && inOverworld) {
     // 48 -> 56 (run 597/598): nine deaths in two hours at a flooded shaft
     // under the village, entered from a cave at y=50 to 55 that no non-miner
     // has any business in (Atlas: "path held with no keys at (301, 55,
