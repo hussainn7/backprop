@@ -96,7 +96,13 @@ away, so retreats doubled to 21 %); round 2 uses Φ(s′) − Φ(s).
 * **Chat callouts** (`src/bot/team-comms.ts`, rate-limited): "Spotted SirFinnn at x y z",
   "6 HP at x y z, need backup!", "On my way, Flora!", "Pearling in!", "Got him!",
   "I'm down, he's at x y z", and every 3 min each leader reports what its squad has learned.
-* **Help board**: a bot at 8 HP or less posts a help request (`logs/help.json`); teammates
+* **Pursuit** (`src/bot/pursuit.ts`): long chases walk 32-block waypoints along the bearing
+  and wait for the pathfinder's own result instead of cancelling slow searches; bots in
+  water swim straight at him; when stuck they pearl-hop, detour, then tunnel out in 12-block
+  steps, and a bot pinned for a minute rejoins for a fresh client.
+* **1.21 enchantment fix** (`src/bot/enchant-compat.ts`): enchanted tools broke mineflayer's
+  dig-time maths, so any bot that had to dig never moved; enchantments are normalized first.
+* **Help board**: a bot that drops to 8 HP or less while fighting him (not from a fall or a mob) posts a help request (`logs/help.json`); teammates
   within 40 blocks get the `ally hurt` feature and the learned `backup` tactic.
 
 ### Modes

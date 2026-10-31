@@ -23,6 +23,7 @@ import { CombatLearner, availableTactics, stateKey, type CombatState, type Tacti
 import { huntIsPrimary } from "./hunt-mode.js";
 import { latestSighting, predict, reportSighting } from "./sighting.js";
 import { say, fmt, requestHelp, clearHelp, helpRequests } from "./team-comms.js";
+import { Pursuit } from "./pursuit.js";
 import { isHostile } from "./perception.js";
 import { PearlAim, trajectory } from "../learn/pearl-aim.js";
 import { baseMoves } from "./navigation.js";
@@ -255,6 +256,8 @@ const DECISION_MS = 1200;
  */
 const potential = (dist: number) => -Math.min(dist, 40) / 4;
 
+const lastRejoin = new Map<string, number>();
+
 // Hits on the target by any bot of this squad: the team part of the reward.
 let teamHits = 0;
 let lastCallout = 0;
@@ -292,6 +295,11 @@ export function startHunter(bot: Bot, brain: Pausable): void {
   let lastHp = 20;
   let lastTargetSwing = 0;
   let lastTargetHurt = 0;
+  // Help is for fights with him: health is only trusted after the server sent
+  // it (it reads 0 right after login), and damage must have come from him.
+  let healthKnown = false;
+  let lastHurtByTarget = 0;
+  let engaged = false;
 
   // A raised shield slows the bot to sneaking speed: lower it to run or swing.
   const lowerShield = () => {
@@ -516,6 +524,45 @@ export function startHunter(bot: Bot, brain: Pausable): void {
     bot.pathfinder.setGoal(goal, true);
   };
 
+  /**
+   * Movement for the hunt. baseMoves keeps protected blocks (chests, beds...)
+   * safe, but for a bot without a pickaxe it pins canDig to false through a
+   * getter, so a bot that respawned inside a closed shelter could never get
+   * out: all ten sat on their beds 340 blocks away. Hunters may dig (by hand
+   * if need be), open doors and pillar up. Re-applied whenever something else
+   * swapped the movements (respawn safety, a skill before the hunt began).
+   */
+  let huntMoves: ReturnType<typeof baseMoves> | null = null;
+  const ensureHuntMoves = () => {
+    if (!huntMoves) {
+      huntMoves = baseMoves(bot);
+      Object.defineProperty(huntMoves, "canDig", { value: true, writable: true, configurable: true, enumerable: true });
+      huntMoves.canOpenDoors = true;
+      huntMoves.allow1by1towers = true;
+      huntMoves.allowSprinting = true;
+      huntMoves.allowParkour = true;
+    }
+    if (bot.pathfinder.movements !== huntMoves) bot.pathfinder.setMovements(huntMoves);
+  };
+
+  const pursuit = new Pursuit(bot, {
+    // Pearl hops only to get unstuck, and not when a 5 HP landing could kill.
+    hop: (p) => {
+      if (pearlBusy || pearls() === 0 || bot.health < 8 || !planThrow(p)) return false;
+      void throwPearl(p, "pursuit hop");
+      return true;
+    },
+    // At most once per 10 min per bot (the map outlives the bot instance).
+    rejoin: () => {
+      const now = Date.now();
+      if (now - (lastRejoin.get(bot.username) ?? 0) < 600_000) return false;
+      lastRejoin.set(bot.username, now);
+      setTimeout(() => bot.quit(), 200);
+      return true;
+    },
+    log: (m) => console.log(`[Hunt] ${bot.username} ${m}`),
+  });
+
   const swing = (ent: Entity) => {
     lowerShield();
     lastSwing = Date.now();
@@ -669,29 +716,33 @@ export function startHunter(bot: Bot, brain: Pausable): void {
       hunting = true;
       brain.pause();
       if (isSkillRunning(bot)) abortActiveSkill(bot);
-      const moves = baseMoves(bot);
-      moves.allowSprinting = true;
-      moves.allowParkour = true;
-      moves.canDig = bot.inventory.items().some((i) => i.name.endsWith("_pickaxe"));
-      bot.pathfinder.setMovements(moves);
       lastHp = bot.health;
       console.log(`[Hunt] ${bot.username} hunting ${name} (${target.distanceTo(bot.entity.position).toFixed(0)} blocks away, ${pearls()} pearls)`);
     }
-    // Call for backup while hurt; withdraw the call once healed.
-    if (bot.health <= 8) {
-      requestHelp(bot.username, bot.entity.position, bot.health, dimension());
-      say(bot, "help", `${Math.round(bot.health)} HP at ${fmt(bot.entity.position)}, need backup!`, 15_000);
-    } else if (bot.health > 12) {
-      clearHelp(bot.username);
-    }
     if (pearlBusy) return;
+    ensureHuntMoves();
     if (now - lastEquip > 5000) {
       lastEquip = now;
       equipBestWeapon(bot);
     }
 
     const dist = target.distanceTo(bot.entity.position);
+
+    // Call for backup only when he is the one hurting us, up close; withdraw
+    // the call once healed or out of the fight.
+    const fighting = !!ent && dist <= 12 && now - lastHurtByTarget < 6000;
+    if (healthKnown && bot.health > 0 && bot.health <= 8 && fighting) {
+      requestHelp(bot.username, bot.entity.position, bot.health, dimension());
+      say(bot, "help", `${Math.ceil(bot.health)} HP fighting ${name} at ${fmt(bot.entity.position)}, need backup!`, 15_000);
+    } else if (!fighting || bot.health > 12) {
+      clearHelp(bot.username);
+    }
+
     if (ent && dist <= 40) {
+      if (!engaged) {
+        engaged = true;
+        pursuit.reset();
+      }
       // Engaged: the learner picks a tactic for each decision window.
       if (!win || now - win.start >= DECISION_MS) {
         const state = observe(ent);
@@ -725,12 +776,13 @@ export function startHunter(bot: Bot, brain: Pausable): void {
       // Not in sight: no learning. Head for where he WILL be (intercept), using
       // a squadmate's sighting and his velocity, else his last known position.
       finish(null, null);
-      if (followed || goalKind) resetMotion();
-      const aim = seen ? predict(seen, (now - seen.at) / 1000 + dist / 5.6) : target;
-      if (!lastGoal || lastGoal.distanceTo(aim) > 4 || !bot.pathfinder.isMoving()) {
-        lastGoal = aim.clone();
-        bot.pathfinder.setGoal(new goals.GoalNear(aim.x, aim.y, aim.z, 2));
+      if (engaged) {
+        engaged = false;
+        resetMotion();
+        pursuit.reset();
       }
+      const aim = seen ? predict(seen, (now - seen.at) / 1000 + dist / 5.6) : target;
+      pursuit.step(aim);
     }
     if (now - lastLog > 30_000) {
       lastLog = now;
@@ -742,6 +794,11 @@ export function startHunter(bot: Bot, brain: Pausable): void {
   // ── Reward and state signals ──
   bot.on("entityHurt", (e: Entity) => {
     const now = Date.now();
+    if (e === bot.entity) {
+      const him = bot.players[name]?.entity;
+      if (him && him.position.distanceTo(bot.entity.position) <= 5) lastHurtByTarget = now;
+      return;
+    }
     if (e.username === name) {
       lastTargetHurt = now;
       if (win && now - lastSwing < 600 && e.position.distanceTo(bot.entity.position) <= 4.5) {
@@ -756,6 +813,7 @@ export function startHunter(bot: Bot, brain: Pausable): void {
     if (e.username === name) lastTargetSwing = Date.now();
   });
   bot.on("health", () => {
+    healthKnown = true;
     if (win && bot.health < lastHp) win.hpLost += lastHp - bot.health;
     lastHp = bot.health;
   });
@@ -773,6 +831,9 @@ export function startHunter(bot: Bot, brain: Pausable): void {
       say(bot, "down", p ? `I'm down. ${name} is at ${fmt(p)}, finish him!` : "I'm down!", 10_000);
     }
     clearHelp(bot.username);
+    pursuit.reset();
+    engaged = false;
+    huntMoves = null; // rebuilt after respawn (scaffolding blocks may have changed)
     finish(null, "death");
     followed = null;
     goalKind = "";
