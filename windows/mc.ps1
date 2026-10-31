@@ -54,7 +54,10 @@ function Halt($piece) {
     Children $piece | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Write-Host "$piece stopped"
 }
-function Log($piece, $msg) { Add-Content (Join-Path $Logs "$(LogName $piece).log") "$(Get-Date -Format s) [mc.ps1] $msg" }
+# Best effort: a log viewer holding the file (e.g. tail -F) must never stop the bots.
+function Log($piece, $msg) {
+    try { Add-Content (Join-Path $Logs "$(LogName $piece).log") "$(Get-Date -Format s) [mc.ps1] $msg" -ErrorAction Stop } catch { }
+}
 function RunSquad($squad) {
     $env:SQUAD = $squad
     $env:DASHBOARD_PORT = "$($Squads[$squad])"
