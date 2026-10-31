@@ -51,17 +51,40 @@ export function simulateRange(pitch: number, dy: number): number | null {
   return null;
 }
 
+/** Flight path as [forward, height above the feet] per tick, up to where it passes height dy. */
+export function trajectory(pitch: number, dy: number): [number, number][] {
+  const pts: [number, number][] = [[0, EYE]];
+  let x = 0;
+  let y = EYE;
+  let vx = Math.cos(pitch) * SPEED;
+  let vy = Math.sin(pitch) * SPEED;
+  for (let tick = 0; tick < 400; tick++) {
+    const py = y;
+    x += vx;
+    y += vy;
+    vx *= DRAG;
+    vy = vy * DRAG - GRAVITY;
+    pts.push([x, y]);
+    if ((py - dy) * (y - dy) <= 0 && py !== dy) break;
+    if (y < dy - 64) break;
+  }
+  return pts;
+}
+
 /**
- * Low-arc pitch (radians, positive = up) that physics says lands at (d, dy);
- * null when out of range. Range is not monotonic in pitch for targets above
- * the thrower (some pitches never reach that height), so scan upward for the
- * first sign change between two pitches that both reach it, then bisect.
+ * Pitch (radians, positive = up) that physics says lands at (d, dy); null
+ * when out of range. "low" is the flat, fast arc; "high" lobs over obstacles.
+ * Range is not monotonic in pitch for targets above the thrower (some pitches
+ * never reach that height), so scan for the first sign change between two
+ * pitches that both reach it (upward for low, downward for high), then bisect.
  */
-export function physicsPitch(d: number, dy: number): number | null {
+export function physicsPitch(d: number, dy: number, arc: "low" | "high" = "low"): number | null {
   const at = (p: number) => simulateRange(p, dy);
-  let prevP = -40 * DEG;
+  const from = arc === "low" ? -40 : 85;
+  const step = arc === "low" ? 0.5 : -0.5;
+  let prevP = from * DEG;
   let prevR = at(prevP);
-  for (let deg = -39.5; deg <= 60; deg += 0.5) {
+  for (let deg = from + step; arc === "low" ? deg <= 60 : deg >= 20; deg += step) {
     const p = deg * DEG;
     const r = at(p);
     if (prevR !== null && r !== null && (prevR - d) * (r - d) <= 0) {
@@ -100,6 +123,7 @@ interface Throw {
   correction: number;
   /** Hit something mid-flight (a tree, a wall): not evidence about the aim. */
   blocked?: boolean;
+  arc?: "low" | "high";
 }
 
 interface ModelState {
@@ -153,23 +177,30 @@ export class PearlAim {
   }
 
   /** Pitch to throw at for a target d blocks away horizontally and dy above the feet. */
-  aim(d: number, dy: number): number | null {
-    const p = physicsPitch(d, dy);
-    return p === null ? null : p + this.correction(d, dy);
+  aim(d: number, dy: number, arc: "low" | "high" = "low"): number | null {
+    const p = physicsPitch(d, dy, arc);
+    // The correction is learned from low-arc throws only; lobs fly on physics.
+    return p === null ? null : arc === "low" ? p + this.correction(d, dy) : p;
   }
 
   /**
    * Learn from one throw: pitch used, the target, and where the bot landed,
    * all relative to the thrower's start (forward = along the throw's yaw).
    */
-  learn(bot: string, pitch: number, target: { d: number; dy: number }, landed: { forward: number; lateral: number; dy: number }): void {
+  learn(
+    bot: string,
+    pitch: number,
+    target: { d: number; dy: number },
+    landed: { forward: number; lateral: number; dy: number },
+    arc: "low" | "high" = "low",
+  ): void {
     // A free flight is explained by physics up to a few degrees. A pearl that
     // stopped on a trunk or wall mid-air gives an implausible hindsight label,
     // so it is recorded but never trained on.
-    const relabel = physicsPitch(landed.forward, landed.dy);
+    const relabel = physicsPitch(landed.forward, landed.dy, arc);
     const label = relabel === null ? null : pitch - relabel;
     const blocked = label === null || landed.forward <= 1 || Math.abs(label) > 8 * DEG;
-    if (!blocked) {
+    if (!blocked && arc === "low") {
       rlsUpdate(this.m, features(landed.forward, landed.dy), label!);
       this.m.samples++;
     }
@@ -183,6 +214,7 @@ export class PearlAim {
       lateral: +landed.lateral.toFixed(2),
       correction: +(this.correction(target.d, target.dy) / DEG).toFixed(2),
       blocked,
+      arc,
     });
     if (this.m.throws.length > 500) this.m.throws.shift();
     const tmp = `${this.file}.tmp`;

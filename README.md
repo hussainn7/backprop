@@ -64,7 +64,7 @@ Each bot in sight of the target makes a decision every 1.2 s.
 | **Actions** (8) | `rush` sprint-hit · `crit` jump and strike while falling (1.5× damage) · `wtap` sprint-hit then release for extra knockback · `shield` advance blocking, drop to swing · `strafe` circle-strafe · `retreat` · `pearl_close` pearl next to the target · `pearl_escape` pearl away when hurt |
 | **Reward** | +1 per hit landed (the target's hurt animation within 600 ms of our swing) − 0.5 per HP lost + distance closed / 5 + 10 for the kill (from the server's death message) − 10 for dying + 2 when a squadmate gets the kill |
 | **Update** | Q(s,a) ← Q(s,a) + α [r + γ·maxₐ′ Q(s′,a′) − Q(s,a)], α = 0.2, γ = 0.6 |
-| **Exploration** | ε-greedy, ε = max(0.05, 0.35·0.996ⁿ), untried tactics first |
+| **Exploration** | ε-greedy with a per-state rate ε(s) = max(0.05, 0.5/√(1 + visits(s))), untried tactics first: common situations exploit what was learned, rare ones keep experimenting |
 
 All five bots of a squad share one Q-table, so a lesson one bot learns is used by all
 five on their next decision. The table persists in `agent-swarm/logs/learning/combat-q-<squad>.json`
@@ -83,6 +83,12 @@ and every decision (state, tactic, explored?, reward, hits, damage) is appended 
    *there*, pitch *p* was right", while physics would have said *p*ₚₕᵧₛ(there). The
    residual *p* − *p*ₚₕᵧₛ trains a **recursive-least-squares** regression on features
    [1, d, dy, d², d·dy]. Aim = *p*ₚₕᵧₛ(target) + correction(target).
+3. **Terrain check.** Before throwing, the bot traces the arc through the real blocks. If
+   the low arc would clip a hillside, trunk or wall short of the target it tries a high
+   lob; if both are blocked it keeps the pearl. (The first live samples showed why: the
+   worst misses, 8–18 blocks, were all throws at targets downhill that hit the slope.)
+   Lobs fly on physics alone; the learned correction is trained on low-arc throws.
+
    A throw whose hindsight label is implausible (more than 8° from physics) stopped on a
    tree or wall mid-flight; it is recorded as *blocked* and never trained on.
 

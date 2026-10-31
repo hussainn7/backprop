@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { simulateRange, physicsPitch, PearlAim } from "./pearl-aim.js";
+import { simulateRange, physicsPitch, trajectory, PearlAim } from "./pearl-aim.js";
 import { CombatLearner, stateKey, availableTactics, type CombatState } from "./combat-learner.js";
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "learn-"));
@@ -19,6 +19,20 @@ test("physics inversion round-trips: the solved pitch lands on the target", () =
     assert.ok(p !== null, `no solution for d=${d} dy=${dy}`);
     const r = simulateRange(p!, dy)!;
     assert.ok(Math.abs(r - d) < 0.05, `d=${d} dy=${dy} landed at ${r}`);
+  }
+});
+
+test("high-arc lobs also land on the target, at a steeper pitch than the low arc", () => {
+  for (const [d, dy] of [
+    [15, 0],
+    [25, -4],
+  ]) {
+    const low = physicsPitch(d, dy, "low")!;
+    const high = physicsPitch(d, dy, "high")!;
+    assert.ok(high > low + 0.2, `high ${high} should be well above low ${low}`);
+    assert.ok(Math.abs(simulateRange(high, dy)! - d) < 0.05, "the lob lands on target");
+    const path = trajectory(high, dy);
+    assert.ok(Math.max(...path.map((p) => p[1])) > Math.max(...trajectory(low, dy).map((p) => p[1])) + 3, "the lob clears higher");
   }
 });
 
@@ -53,7 +67,9 @@ test("Q-learning prefers the tactic that pays off", () => {
   }
   const best = options.reduce((a, b) => (learner.q(stateKey(s), b) > learner.q(stateKey(s), a) ? b : a));
   assert.equal(best, "crit");
-  assert.ok(learner.epsilon < 0.35, "exploration decays");
+  assert.ok(learner.stateEpsilon(stateKey(s)) < 0.1, "a well-visited state mostly exploits");
+  const rare: CombatState = { ...s, dist: 30 };
+  assert.equal(learner.stateEpsilon(stateKey(rare)), 0.5, "an unseen state still explores");
 });
 
 test("pearl tactics are only offered with pearls and at sensible ranges", () => {

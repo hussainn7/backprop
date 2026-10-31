@@ -8,7 +8,10 @@
 //             height difference, allies near the target)        270 states
 //   action = one tactic held for a ~1.2 s decision window             8 tactics
 //   reward = hits landed − damage taken + closing distance + kill/death bonus
-//   update = Q(s,a) += α · (r + γ · max_a' Q(s',a') − Q(s,a)),  ε-greedy choice
+//   update = Q(s,a) += α · (r + γ · max_a' Q(s',a') − Q(s,a))
+//   choice = ε-greedy with a per-state ε = max(0.05, 0.5/√(1+visits(s))): a
+//            situation keeps exploring until it has been seen often enough,
+//            however many updates the rest of the table has had
 //
 // Persisted to logs/learning/combat-q-<squad>.json; every decision is appended
 // to combat-experience-<squad>.jsonl so learning can be audited and replayed.
@@ -54,9 +57,8 @@ export interface Experience {
 
 const ALPHA = 0.2;
 const GAMMA = 0.6;
-const EPS_START = 0.35;
+const EPS_SCALE = 0.5;
 const EPS_MIN = 0.05;
-const EPS_DECAY = 0.996; // per update
 
 /** Discretize a raw combat state into its table key. */
 export function stateKey(s: CombatState): string {
@@ -109,8 +111,22 @@ export class CombatLearner {
     fs.mkdirSync(dir, { recursive: true });
   }
 
+  /** How many times a state has been decided in. */
+  visits(key: string): number {
+    return Object.values(this.t.n[key] ?? {}).reduce((a, b) => a + (b ?? 0), 0);
+  }
+
+  /** Per-state exploration rate: frequent situations exploit, rare ones keep exploring. */
+  stateEpsilon(key: string): number {
+    return Math.max(EPS_MIN, EPS_SCALE / Math.sqrt(1 + this.visits(key)));
+  }
+
+  /** Visit-weighted mean ε over the states seen so far (what the bots experience). */
   get epsilon(): number {
-    return Math.max(EPS_MIN, EPS_START * Math.pow(EPS_DECAY, this.t.updates));
+    const keys = Object.keys(this.t.n);
+    const total = keys.reduce((a, k) => a + this.visits(k), 0);
+    if (!total) return EPS_SCALE;
+    return keys.reduce((a, k) => a + this.visits(k) * this.stateEpsilon(k), 0) / total;
   }
 
   q(key: string, a: Tactic): number {
@@ -120,7 +136,7 @@ export class CombatLearner {
   /** ε-greedy choice; untried tactics are preferred during exploration. */
   choose(s: CombatState, options: Tactic[], rand = Math.random): { tactic: Tactic; explored: boolean } {
     const key = stateKey(s);
-    if (rand() < this.epsilon) {
+    if (rand() < this.stateEpsilon(key)) {
       const untried = options.filter((a) => !this.t.n[key]?.[a]);
       const pool = untried.length ? untried : options;
       return { tactic: pool[Math.floor(rand() * pool.length)], explored: true };

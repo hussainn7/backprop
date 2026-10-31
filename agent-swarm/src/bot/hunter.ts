@@ -18,8 +18,8 @@ import type { Entity } from "prismarine-entity";
 import { Vec3 } from "vec3";
 import pkg from "mineflayer-pathfinder";
 import { huntPlayer, ALL_BOT_NAMES, SQUAD } from "./squad.js";
-import { CombatLearner, availableTactics, type CombatState, type Tactic } from "../learn/combat-learner.js";
-import { PearlAim } from "../learn/pearl-aim.js";
+import { CombatLearner, availableTactics, stateKey, type CombatState, type Tactic } from "../learn/combat-learner.js";
+import { PearlAim, trajectory } from "../learn/pearl-aim.js";
 import { baseMoves } from "./navigation.js";
 import { abortActiveSkill, isSkillRunning } from "../skills/executor.js";
 
@@ -309,7 +309,7 @@ export function startHunter(bot: Bot, brain: Pausable): void {
       state: `${w.state.dist.toFixed(1)}b hp${w.state.hp.toFixed(0)}${w.state.targetShielding ? " shield" : ""}`,
       tactic: w.tactic,
       explored: w.explored,
-      epsilon: +combat.epsilon.toFixed(3),
+      epsilon: +combat.stateEpsilon(stateKey(w.state)).toFixed(3),
       reward: +reward.toFixed(2),
       hits: w.hits,
       damageTaken: +w.hpLost.toFixed(1),
@@ -337,8 +337,41 @@ export function startHunter(bot: Bot, brain: Pausable): void {
       const dz = point.z - start.z;
       const d = Math.hypot(dx, dz);
       const dy = point.y - start.y;
-      const pitch = pearl.aim(d, dy);
-      if (pitch === null || d < 2) return;
+      if (d < 2) return;
+      // Trace each candidate arc through the real blocks; a pearl that would
+      // clip a hillside, trunk or wall well short of the target is not thrown.
+      const fx0 = dx / d;
+      const fz0 = dz / d;
+      const clear = (p: number) => {
+        const path = trajectory(p, dy);
+        for (let i = 1; i < path.length; i++) {
+          const [ax, ay] = path[i - 1];
+          const [bx, by] = path[i];
+          const steps = Math.ceil(Math.hypot(bx - ax, by - ay) / 0.4);
+          for (let k = 1; k <= steps; k++) {
+            const fwd = ax + ((bx - ax) * k) / steps;
+            if (fwd > d - 2) return true; // reached the target area
+            const y = ay + ((by - ay) * k) / steps;
+            const b = bot.blockAt(new Vec3(start.x + fx0 * fwd, start.y + y, start.z + fz0 * fwd).floored());
+            if (b && b.boundingBox === "block") return false;
+          }
+        }
+        return true;
+      };
+      let pitch: number | null = null;
+      let arc = "";
+      for (const a of ["low", "high"] as const) {
+        const p = pearl.aim(d, dy, a);
+        if (p !== null && clear(p)) {
+          pitch = p;
+          arc = a;
+          break;
+        }
+      }
+      if (pitch === null) {
+        console.log(`[Learn] ${bot.username} pearl (${why}) not thrown: no clear arc over the terrain to ${d.toFixed(0)} blocks`);
+        return;
+      }
       await bot.look(Math.atan2(-dx, -dz), pitch, true);
       const landed = await new Promise<Vec3 | null>((resolve) => {
         const onMove = () => {
@@ -362,9 +395,9 @@ export function startHunter(bot: Bot, brain: Pausable): void {
       const lateral = rz * fx - rx * fz;
       // A teleport from elsewhere (death, an admin /tp) is not a pearl landing.
       if (forward > 0.5 && forward < 70 && Math.abs(lateral) < 8) {
-        pearl.learn(bot.username, pitch, { d, dy }, { forward, lateral, dy: landed.y - start.y });
+        pearl.learn(bot.username, pitch, { d, dy }, { forward, lateral, dy: landed.y - start.y }, arc as "low" | "high");
         const err = Math.hypot(forward - d, lateral, landed.y - start.y - dy);
-        console.log(`[Learn] ${bot.username} pearl (${why}) aimed ${d.toFixed(1)} blocks, landed ${err.toFixed(1)} off target`);
+        console.log(`[Learn] ${bot.username} pearl (${why}, ${arc} arc) aimed ${d.toFixed(1)} blocks, landed ${err.toFixed(1)} off target`);
       }
     } catch (err) {
       console.warn(`[Hunt] ${bot.username} pearl failed: ${(err as Error).message}`);
