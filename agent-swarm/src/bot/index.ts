@@ -13,10 +13,12 @@ import { registerBot as registerViewerBot, isUnifiedViewerStarted } from "../str
 import { startViewer } from "../stream/viewer.js";
 import { addChatMessage, setCurrentBot } from "../stream/overlay.js";
 import { abortActiveSkill, getActiveSkillName } from "../skills/executor.js";
-import { registerBotMemory } from "./memory-registry.js";
+import { registerBotMemory, getBotMemoryStore } from "./memory-registry.js";
 import { PlanStore } from "../plan/state.js";
 import { registerBotPlan } from "../plan/registry.js";
+import { getPlanLine } from "../plan/line.js";
 import { getTeamStatus } from "./bulletin.js";
+import { readTeamEarned } from "./advancement-progress.js";
 import { skillRegistry } from "../skills/registry.js";
 import { BotMemoryStore } from "./memory.js";
 import { BotRoleConfig, ATLAS_CONFIG } from "./role.js";
@@ -131,6 +133,28 @@ export async function createBot(events: BrainEvents, roleConfig: BotRoleConfig =
   const planStore = new PlanStore(planFile);
   planStore.load();
   registerBotPlan(bot, planStore);
+
+  // Tick the planner independently of the brain's strategic cycle. The brain
+  // only calls getPlanLine while building a prompt, and a bot deep inside
+  // wood_run (or any long skill) never reaches that path — Nova's plan file
+  // existed after 10 min while nine other bots had empty state. One 30 s
+  // timer here guarantees every bot's plan state advances and milestones
+  // record even mid-skill. Pure read on the inventory; no side effects on
+  // the active skill. unref so it never keeps the process alive.
+  const planTick = setInterval(() => {
+    try {
+      if (!bot.entity) return; // not spawned yet; nothing to snapshot
+      const mem = getBotMemoryStore(bot);
+      getPlanLine(bot, {
+        earnedAdvancements: readTeamEarned(BOT_ROSTER.map((b) => b.name)),
+        hasShelter: mem ? mem.hasStructureNearby("house", 0, 0, 0, 1_000_000) : false,
+        hasFarm: mem ? mem.hasStructureNearby("farm", 0, 0, 0, 1_000_000) : false,
+      });
+    } catch (err) {
+      console.warn(`[Plan] ${roleConfig.name} tick failed:`, err);
+    }
+  }, 30_000);
+  planTick.unref?.();
 
   // Safety guards. Mineflayer attaches chat/attack via plugins after
   // createBot() returns, so they are wrapped on login, before any action runs.
