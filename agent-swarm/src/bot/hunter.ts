@@ -80,6 +80,37 @@ function startTracker(name: string): void {
   setInterval(() => void poll(), 1500).unref();
 }
 
+// ── Unbreakable armor (UNBREAKABLE_ARMOR=true) ─────────────────────────────
+// Every 20 s, through the same local RCON, mark every online player's armor
+// and off-hand item (the shield) unbreakable and fully repaired. Idempotent,
+// so both squad processes may run it; empty slots are simply skipped.
+let armorKeeperStarted = false;
+const UNBREAKABLE = '{function:"minecraft:set_components",components:{"minecraft:unbreakable":{},"minecraft:damage":0}}';
+
+export function startArmorKeeper(): void {
+  if (armorKeeperStarted || process.env.UNBREAKABLE_ARMOR !== "true") return;
+  armorKeeperStarted = true;
+  const settings = rconSettings();
+  if (!settings) {
+    console.warn("[Armor] no RCON settings in server/server.properties — cannot keep armor unbreakable");
+    return;
+  }
+  const { Rcon } = createRequire(import.meta.url)("rcon-client");
+  const apply = async () => {
+    try {
+      const rcon = await Rcon.connect({ host: "127.0.0.1", port: settings.port, password: settings.password, timeout: 3000 });
+      for (const slot of ["armor.head", "armor.chest", "armor.legs", "armor.feet", "weapon.offhand"]) {
+        await rcon.send(`item modify entity @a ${slot} ${UNBREAKABLE}`);
+      }
+      await rcon.end();
+    } catch (err) {
+      console.warn(`[Armor] unbreakable pass failed: ${(err as Error).message}`);
+    }
+  };
+  void apply();
+  setInterval(() => void apply(), 20_000).unref();
+}
+
 const sameDimension = (a: string, b: string | undefined) =>
   a.replace(/^minecraft:/, "") === String(b ?? "").replace(/^minecraft:/, "");
 
@@ -110,6 +141,25 @@ function equipBestWeapon(bot: Bot): void {
   if (best && bot.heldItem?.name !== best.name) void bot.equip(best, "hand").catch(() => {});
 }
 
+const OFFHAND_SLOT = 45;
+
+const shieldInOffhand = (bot: Bot) => bot.inventory.slots[OFFHAND_SLOT]?.name === "shield";
+
+/**
+ * Keep a carried shield in the off-hand at all times (every bot carried one in
+ * its pack, unused). A totem of undying already there stays: it saves a life.
+ * With the shield in place the pvp plugin can block in ordinary mob fights too.
+ */
+export function startShieldKeeper(bot: Bot): void {
+  const iv = setInterval(() => {
+    if (!bot.entity || bot.health <= 0 || shieldInOffhand(bot)) return;
+    if (bot.inventory.slots[OFFHAND_SLOT]?.name === "totem_of_undying") return;
+    const shield = bot.inventory.items().find((i) => i.name === "shield");
+    if (shield) void bot.equip(shield, "off-hand").catch(() => {});
+  }, 3000);
+  bot.once("end", () => clearInterval(iv));
+}
+
 export function startHunter(bot: Bot, brain: Pausable): void {
   const name = huntPlayer();
   if (!huntIsPrimary()) return;
@@ -121,9 +171,18 @@ export function startHunter(bot: Bot, brain: Pausable): void {
   let followed: Entity | null = null;
   let lastEquip = 0;
   let lastLog = 0;
+  let blocking = false;
+
+  // A raised shield slows the bot to sneaking speed: lower it to run or swing.
+  const lowerShield = () => {
+    if (!blocking) return;
+    blocking = false;
+    bot.deactivateItem();
+  };
 
   const stop = (why: string) => {
     if (!hunting) return;
+    lowerShield();
     hunting = false;
     followed = null;
     lastGoal = null;
@@ -167,11 +226,21 @@ export function startHunter(bot: Bot, brain: Pausable): void {
       if (dist <= 3.4) {
         void bot.lookAt(ent.position.offset(0, (ent.height ?? 1.8) * 0.85, 0), true);
         if (now - lastSwing >= swingMs(bot)) {
+          lowerShield(); // can't swing from behind a raised shield
           lastSwing = now;
           bot.attack(ent);
         }
       }
+      // Between swings in melee range, block with the shield. It needs a
+      // quarter second raised to take effect, which fits inside the cooldown.
+      if (dist <= 4 && !blocking && shieldInOffhand(bot) && now - lastSwing > 100 && now - lastSwing < swingMs(bot) - 150) {
+        blocking = true;
+        bot.activateItem(true);
+      } else if (dist > 4) {
+        lowerShield();
+      }
     } else {
+      lowerShield();
       followed = null;
       if (!lastGoal || lastGoal.distanceTo(target) > 4 || !bot.pathfinder.isMoving()) {
         lastGoal = target.clone();
@@ -195,5 +264,6 @@ export function startHunter(bot: Bot, brain: Pausable): void {
   bot.on("death", () => {
     followed = null;
     lastGoal = null;
+    blocking = false;
   });
 }

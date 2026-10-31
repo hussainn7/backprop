@@ -38,7 +38,7 @@ import { createFallTracker, isFallDeath } from "./fall-tracker.js";
 import { shouldFleeOnRespawn } from "./respawn-safety.js";
 import { isHostile } from "./perception.js";
 import { ALL_BOT_NAMES, huntPlayer, registerSquadBot } from "./squad.js";
-import { startHunter } from "./hunter.js";
+import { startArmorKeeper, startHunter, startShieldKeeper } from "./hunter.js";
 
 // Re-export types used by src/index.ts
 export type { ChatMessage, BrainEvents as BotEvents };
@@ -430,7 +430,11 @@ export async function createBot(events: BrainEvents, roleConfig: BotRoleConfig =
 
   // ── Create the event-driven brain ──
   const brain = new BotBrain(bot, roleConfig, events, memStore);
-  bot.once("spawn", () => startHunter(bot, brain));
+  bot.once("spawn", () => {
+    startShieldKeeper(bot);
+    startArmorKeeper();
+    startHunter(bot, brain);
+  });
 
   // ── Spawn safety ──────────────────────────────────────────────────────────
   let spawnSafetyRunning = false;
