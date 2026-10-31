@@ -1,0 +1,57 @@
+// src/stream/dashboard.ts
+// Mission Control — aggregates all bot overlays into one dashboard page.
+
+import express from "express";
+import { createServer } from "http";
+import path from "path";
+import { fileURLToPath } from "url";
+import type { BotRoleConfig } from "../bot/role.js";
+import { getStashSummary } from "../skills/stash-ledger.js";
+import { opsSnapshot, startOpsPolling } from "../monitor/ops.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+const DASHBOARD_PORT = 3010;
+
+export function startDashboard(roster: BotRoleConfig[]) {
+  const app = express();
+  const http = createServer(app);
+
+  // Serve dashboard static files
+  app.use(express.static(path.join(__dirname, "../../dashboard")));
+
+  // API endpoint: live stash contents (from chest snapshots at each deposit/withdraw)
+  app.get("/api/stash", (_req, res) => {
+    res.json(getStashSummary());
+  });
+
+  // API endpoint: server-verified milestones, API spend, TPS, host resources
+  startOpsPolling();
+  app.get("/api/ops", async (_req, res) => {
+    res.json(await opsSnapshot(roster.map((r) => r.username)));
+  });
+
+  // API endpoint: bot roster info (ports, names, roles)
+  app.get("/api/roster", (_req, res) => {
+    res.json(
+      roster.map((r) => ({
+        name: r.name,
+        role: r.role,
+        viewerPort: r.viewerPort,
+        overlayPort: r.overlayPort,
+      })),
+    );
+  });
+
+  http.on("error", (err: NodeJS.ErrnoException) => {
+    if (err.code === "EADDRINUSE") {
+      console.log(`[Dashboard] Port ${DASHBOARD_PORT} in use — dashboard disabled.`);
+      return;
+    }
+    console.error("[Dashboard] Server error:", err);
+  });
+
+  http.listen(DASHBOARD_PORT, process.env.BIND_HOST || "127.0.0.1", () => {
+    console.log(`[Dashboard] Mission Control at http://localhost:${DASHBOARD_PORT}`);
+  });
+}

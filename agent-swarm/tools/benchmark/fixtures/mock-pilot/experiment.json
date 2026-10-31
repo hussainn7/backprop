@@ -1,0 +1,93 @@
+{
+  "adapter": "mock",
+  "benchmark_id": "mock-pilot-v1",
+  "budgets": {
+    "max_input_tokens": 1000,
+    "max_output_tokens": 500,
+    "max_provider_requests": 4,
+    "max_steps": 20,
+    "timeout_seconds": 30
+  },
+  "case_study_manifest": {
+    "path": "case-study.json",
+    "sha256": "218321f04f050593f8bc535a3b677f61e3ae63dc29f71b72c101151434cc37bc"
+  },
+  "code": {
+    "controller": {
+      "identity": "unavailable",
+      "kind": "synthetic_fixture"
+    },
+    "evaluator": {
+      "files": [
+        {
+          "path": "tools/benchmark/manifest.py",
+          "sha256": "285529ad5c2bbb28563a7f2de512904a01c3b13f06ab460fef5ff63fcfc6f5dd"
+        },
+        {
+          "path": "tools/benchmark/predicates.py",
+          "sha256": "b60a935c0b9a66113555395ee1c46732d9d68770187edce17a0f241640e72346"
+        },
+        {
+          "path": "tools/benchmark/runner.py",
+          "sha256": "b537b949d6697f34f4a954051e314891a641f7e3011222fa03dd090dc0dd0689"
+        }
+      ],
+      "kind": "content_sha256"
+    }
+  },
+  "collection_context": {
+    "git_commit": null,
+    "operation_mode": "synthetic_fixture",
+    "trial_id": "mock-pilot-v1",
+    "world_snapshot_id": "mock-world-v1"
+  },
+  "conditions": [
+    {
+      "config": {
+        "path": "baseline.json",
+        "sha256": "9dd5f487965812ceb96145928ccfccb8ac24bc133d2322b4a3b9a9a35d1b3c44"
+      },
+      "id": "baseline",
+      "kind": "baseline"
+    },
+    {
+      "config": {
+        "path": "coordination.json",
+        "sha256": "c3ccccf464f584ef1516d69a79f78f94e502e0ab39adbb8582e918986c94cca0"
+      },
+      "id": "coordination",
+      "kind": "coordination"
+    },
+    {
+      "config": {
+        "path": "coaching.json",
+        "sha256": "f36cdce0fb42bbff21f779e4de29fcc73b2bf1ae1f10b6af58a6dfbba1a4e2aa"
+      },
+      "id": "coaching",
+      "kind": "coaching"
+    }
+  ],
+  "model_manifest": {
+    "path": "model.json",
+    "sha256": "98ce8bc7cb917f4d6a5370b9896a512cdaa407e93d3f54db51a4cdfcec07688e"
+  },
+  "observation_manifest": {
+    "path": "observations.json",
+    "sha256": "22c06d0d073ae57cd3cf7851d23ea0cd72497eb5c4743ee1726122f2c7cd72be"
+  },
+  "reset_manifest": {
+    "path": "reset.json",
+    "sha256": "ece1cb692b315972f095c77623b601585c0a75de4b598b546b04c3c1cef51cdd"
+  },
+  "scenario_manifest": {
+    "path": "scenarios.json",
+    "sha256": "f71fcaa737a18d42fad0f5cc01987aab4f37a0830200867e305f8c9114402ea1"
+  },
+  "schema_version": 1,
+  "seeds": [
+    11,
+    22,
+    33,
+    44
+  ]
+}

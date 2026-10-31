@@ -1,0 +1,265 @@
+/**
+ * Runtime lifecycle for `Skill` implementations from `types.ts`.
+ *
+ * @remarks
+ * A skill declares metadata, material estimates, and an abort-aware `execute`
+ * method. `runSkill` serializes work per bot, gathers materials, forwards
+ * progress, and races execution against `skill.timeoutMs` or the 240-second
+ * default. `abortActiveSkill` signals cooperative cancellation; the watchdog
+ * additionally stops navigation and digging so a hung await cannot freeze the
+ * brain. New skills should honor `AbortSignal`, bound internal phases, return a
+ * `SkillResult`, and be registered in `registry.ts`.
+ */
+import type { Bot } from "mineflayer";
+import type { Skill, SkillProgress, SkillResult } from "./types.js";
+import { gatherMaterials } from "./materials.js";
+import { updateOverlay } from "../stream/overlay.js";
+import { recordSkillAttempt } from "../bot/memory.js";
+import { getBotMemoryStore, registerBotMemory } from "../bot/memory-registry.js";
+import { bumpNavGeneration } from "../bot/navigation.js";
+
+/** Associates a bot with its memory store before skill execution begins. */
+export { registerBotMemory };
+
+type ActiveSkillState = {
+  skill: Skill;
+  abortController: AbortController;
+  promise: Promise<SkillResult>;
+  startTime: number;
+};
+
+// Per-bot skill state — keyed by bot instance so multiple bots don't interfere.
+const activeSkillMap = new Map<Bot, ActiveSkillState>();
+
+/**
+ * The truthful outcome of each bot's most recent skill run.
+ *
+ * runSkill returns only `result.message`, so by the time the brain sees a skill
+ * result it is a bare string and the boolean is gone. The brain then guessed at
+ * success by pattern-matching that string, which meant "collectBamboo
+ * completed." and "HOUSE BUILT!" read as failures — and two successful runs of
+ * a working skill were enough to blacklist it.
+ *
+ * Keyed by bot instance for the same reason activeSkillMap is: five bots share
+ * this module and must not read each other's outcomes.
+ */
+const lastSkillOutcome = new WeakMap<Bot, { skill: string; success: boolean }>();
+
+/** The recorded outcome, if the last skill run for this bot was `skillName`. */
+export function takeSkillOutcome(bot: Bot, skillName: string): boolean | undefined {
+  const rec = lastSkillOutcome.get(bot);
+  if (!rec || rec.skill !== skillName) return undefined;
+  lastSkillOutcome.delete(bot); // single-use: a stale outcome must never be reused
+  return rec.success;
+}
+
+/** Returns whether this bot currently owns an active skill execution slot. */
+export function isSkillRunning(bot: Bot): boolean {
+  return activeSkillMap.has(bot);
+}
+
+/** Returns the active skill name for a bot, or `null` when it is idle. */
+export function getActiveSkillName(bot: Bot): string | null {
+  return activeSkillMap.get(bot)?.skill.name ?? null;
+}
+
+/**
+ * Requests cooperative cancellation of the bot's active skill.
+ * The skill must observe its `AbortSignal`; timeout cleanup separately handles
+ * stuck navigation and digging calls.
+ */
+export function abortActiveSkill(bot: Bot): void {
+  const active = activeSkillMap.get(bot);
+  if (active) {
+    console.log(`[Skill] Aborting skill "${active.skill.name}"`);
+    active.abortController.abort();
+  }
+}
+
+/**
+ * Run a skill to completion: gather materials → execute → return result string.
+ * Called from executeAction() when the LLM picks a skill action.
+ *
+ * @param bot - Bot that owns the single active execution slot.
+ * @param skill - Registered skill implementing the interface in `types.ts`.
+ * @param params - LLM-provided parameters passed to estimation and execution.
+ * @returns A concise result message for the brain; expected failures and
+ * crashes are recorded and converted to messages.
+ */
+export async function runSkill(bot: Bot, skill: Skill, params: Record<string, any>): Promise<string> {
+  const active = activeSkillMap.get(bot);
+  if (active) {
+    return `Already running skill "${active.skill.name}". Wait for it to finish.`;
+  }
+
+  const abortController = new AbortController();
+  const { signal } = abortController;
+  const startTime = Date.now();
+
+  console.log(`[Skill] Starting "${skill.name}"`);
+
+  const progress = (p: SkillProgress) => {
+    updateOverlay({ skillProgress: p });
+    if (p.message) {
+      console.log(`[Skill] ${skill.name}: ${p.phase} — ${p.message} (${Math.round(p.progress * 100)}%)`);
+    }
+  };
+
+  // Phase 1: Gather materials
+  progress({
+    skillName: skill.name,
+    phase: "Checking materials",
+    progress: 0,
+    message: "Scanning inventory...",
+    active: true,
+  });
+
+  const materialsNeeded = skill.estimateMaterials(bot, params);
+  const materialsList = Object.entries(materialsNeeded);
+
+  if (materialsList.length > 0) {
+    const summary = materialsList.map(([k, v]) => `${v}x ${k}`).join(", ");
+    console.log(`[Skill] Materials needed: ${summary}`);
+
+    try {
+      const gatherResult = await gatherMaterials(bot, materialsNeeded, signal, (msg, pct) => {
+        progress({
+          skillName: skill.name,
+          phase: "Gathering materials",
+          progress: pct * 0.3,
+          message: msg,
+          active: true,
+        });
+      });
+
+      if (!gatherResult.success) {
+        progress({ skillName: skill.name, phase: "Failed", progress: 0, message: gatherResult.message, active: false });
+        return `Skill ${skill.name} failed: ${gatherResult.message}`;
+      }
+    } catch (err: any) {
+      progress({ skillName: skill.name, phase: "Failed", progress: 0, message: err.message, active: false });
+      return `Skill ${skill.name} crashed during gathering: ${err.message}`;
+    }
+  }
+
+  if (signal.aborted) {
+    progress({ skillName: skill.name, phase: "Aborted", progress: 0, message: "Interrupted!", active: false });
+    return `Skill ${skill.name} was interrupted.`;
+  }
+
+  // Phase 2: Execute the skill. This skill is now the pathfinder's legitimate
+  // owner — advance the nav generation so any earlier walk (a zombie skill's
+  // still-unwinding safeGoto) stops retrying itself back into contention.
+  bumpNavGeneration(bot);
+  const skillPromise = skill.execute(bot, params, signal, (p) => {
+    progress({
+      ...p,
+      progress: 0.3 + p.progress * 0.7, // Remap: gathering = 0-30%, execution = 30-100%
+    });
+  });
+
+  activeSkillMap.set(bot, { skill, abortController, promise: skillPromise, startTime });
+
+  // Skill chatter — bot narrates every 30s so the stream isn't dead air during long skills
+  const SKILL_QUIPS = [
+    "Still working on it... this better be worth it.",
+    "Don't rush me, I'm an AI. Time is relative.",
+    "Going great. Totally under control.",
+    "This is fine. Everything is fine.",
+    "Almost there... maybe.",
+    "I have no idea how long this will take.",
+    "Chat, if this works, you owe me a follow.",
+    "My hands are a blur right now. Well, I don't have hands. You know what I mean.",
+    "The process is the journey. Or something. I don't know, I'm busy.",
+  ];
+  const chatterInterval = setInterval(() => {
+    if (activeSkillMap.has(bot)) {
+      const quip = SKILL_QUIPS[Math.floor(Math.random() * SKILL_QUIPS.length)];
+      bot.chat(quip);
+    }
+  }, 30000);
+
+  // HARD WATCHDOG: a skill that blocks in an unbounded call (e.g. a
+  // pathfinder.goto to an unreachable goal, or bot.dig on a stuck block) never
+  // observes the abort signal, so it freezes the bot's ENTIRE brain loop
+  // indefinitely. Atlas + Flora were frozen ~13h inside a hung strip_mine.
+  // Race the skill against a hard timeout that force-stops movement and RETURNS,
+  // freeing the brain regardless of what the skill's internal await is doing.
+  // Skills may declare a longer budget (strip_mine's diamond run is a
+  // hike + 130-block descent + tunnel and died at 240s mid-journey in run
+  // 370, y=-14 of -58); every phase inside such skills is itself time-boxed.
+  const MAX_SKILL_MS = skill.timeoutMs ?? 240_000;
+  let watchdog: ReturnType<typeof setTimeout> | null = null;
+  const timeoutPromise = new Promise<{ success: boolean; message: string }>((resolve) => {
+    watchdog = setTimeout(() => {
+      // Deliberate takeover: the skill being killed must not retry its walks.
+      bumpNavGeneration(bot);
+      try {
+        bot.pathfinder.setGoal(null); // synchronous reset; stop() only raises a flag that kills the NEXT walk
+      } catch {
+        /* best effort */
+      }
+      try {
+        // Release a hung bot.dig too — otherwise the orphaned skill promise
+        // stays blocked on it and keeps contesting the pathfinder with the
+        // reactive brain (observed: Flora's flee failing "Stuck" mid-hang).
+        bot.stopDigging();
+      } catch {
+        /* wasn't digging */
+      }
+      abortController.abort();
+      resolve({
+        success: false,
+        message: `${skill.name} timed out after ${MAX_SKILL_MS / 1000}s — aborted to free the bot.`,
+      });
+    }, MAX_SKILL_MS);
+    watchdog.unref?.();
+  });
+
+  try {
+    const result = await Promise.race([skillPromise, timeoutPromise]);
+    const durationSeconds = (Date.now() - startTime) / 1000;
+
+    // Hand the brain the real answer instead of making it guess from prose.
+    lastSkillOutcome.set(bot, { skill: skill.name, success: result.success });
+
+    // Record skill attempt in per-bot memory (fallback to singleton for non-registered bots)
+    const memStore = getBotMemoryStore(bot);
+    if (memStore) {
+      memStore.recordSkillAttempt(skill.name, result.success, durationSeconds, result.message);
+    } else {
+      recordSkillAttempt(skill.name, result.success, durationSeconds, result.message);
+    }
+
+    progress({
+      skillName: skill.name,
+      phase: result.success ? "Complete!" : "Failed",
+      progress: result.success ? 1.0 : 0,
+      message: result.message,
+      active: false,
+    });
+
+    console.log(`[Skill] "${skill.name}" finished: ${result.message}`);
+    return result.message;
+  } catch (err: any) {
+    const durationSeconds = (Date.now() - startTime) / 1000;
+    lastSkillOutcome.set(bot, { skill: skill.name, success: false });
+    const memStore = getBotMemoryStore(bot);
+    if (memStore) {
+      memStore.recordSkillAttempt(skill.name, false, durationSeconds, `Crashed: ${err.message}`);
+    } else {
+      recordSkillAttempt(skill.name, false, durationSeconds, `Crashed: ${err.message}`);
+    }
+
+    // The message alone hid a null-pointer for an hour — six identical
+    // "reading 'x'" crashes with no line number. The stack goes to the log;
+    // the model still gets the short form.
+    console.error(`[Skill] "${skill.name}" crash stack:\n${err.stack ?? err.message}`);
+    progress({ skillName: skill.name, phase: "Crashed", progress: 0, message: err.message, active: false });
+    return `Skill ${skill.name} crashed: ${err.message}`;
+  } finally {
+    if (watchdog) clearTimeout(watchdog);
+    clearInterval(chatterInterval);
+    activeSkillMap.delete(bot);
+  }
+}

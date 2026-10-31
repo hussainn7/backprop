@@ -1,0 +1,425 @@
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import { test } from "node:test";
+import net from "node:net";
+import { once } from "node:events";
+import { runParticipant } from "./protected-participant.mjs";
+
+function command(type, extra = {}) {
+  return { schema_version: 1, type, trial_id: "trial-01", action_id: "walk-01", ...extra };
+}
+
+function fixture({ movement = "forward", commands = [command("begin"), command("finalize")] } = {}) {
+  const events = [];
+  const bot = new EventEmitter();
+  bot.entity = { position: { x: 0, y: 64, z: 0 } };
+  bot._client = {
+    socket: {
+      destroyed: false,
+      destroy() {
+        this.destroyed = true;
+        events.push("socket:destroy");
+      },
+    },
+    write(name, payload) {
+      assert.equal(name, "player_loaded");
+      assert.deepEqual(payload, {});
+      events.push("handshake");
+    },
+  };
+  bot.waitForTicks = async (ticks) => {
+    assert.equal(ticks, 1);
+    events.push("physicsTick");
+  };
+  bot.setControlState = (key, value) => events.push(`${key}:${value}`);
+  bot.quit = async () => {
+    events.push("quit");
+    bot.emit("end", "quit");
+  };
+  const sent = [];
+  let commandIndex = 0;
+  const args = {
+    trialId: "trial-01",
+    actionId: "walk-01",
+    movement,
+    createBot: async (options) => {
+      assert.deepEqual(options, {
+        host: "127.0.0.1",
+        port: 25585,
+        username: "PilotProbe",
+        auth: "offline",
+        version: "1.21.4",
+        respawn: false,
+      });
+      events.push("create");
+      return bot;
+    },
+    sendMessage: async (message) => {
+      sent.push(message);
+      events.push(`send:${message.type}`);
+    },
+    waitForCommand: async () => {
+      const value = commands[commandIndex++];
+      events.push(`receive:${value?.type}`);
+      return value;
+    },
+    sleep: async (ms) => {
+      assert.equal(ms, 1000);
+      events.push("action:wait");
+    },
+    phaseTimeoutMs: 50,
+    totalTimeoutMs: 500,
+  };
+  return { args, bot, events, sent };
+}
+
+test("completes only the fixed protocol phases and quits after finalize", async () => {
+  const f = fixture();
+  const result = await runParticipant({
+    ...f.args,
+    waitForCommand: async () => {
+      const next = f.sent.length === 1 ? command("begin") : command("finalize");
+      if (next.type === "finalize") assert.equal(f.events.includes("quit"), false);
+      f.events.push(`receive:${next.type}`);
+      return next;
+    },
+  });
+  assert.equal(result.status, "protocol_completed");
+  assert.equal("success" in result, false);
+  assert.deepEqual(f.sent, [command("ready"), command("action_finished")]);
+  assert.deepEqual(f.events.slice(0, 10), [
+    "create",
+    "physicsTick",
+    "handshake",
+    "send:ready",
+    "receive:begin",
+    "forward:true",
+    "action:wait",
+    "forward:false",
+    "send:action_finished",
+    "receive:finalize",
+  ]);
+  assert.ok(f.events.indexOf("quit") > f.events.indexOf("receive:finalize"));
+  assert.equal(f.bot._client.socket.destroyed, true);
+});
+
+test("stationary mode never enables forward", async () => {
+  const f = fixture({ movement: "stationary" });
+  const result = await runParticipant(f.args);
+  assert.equal(result.status, "protocol_completed");
+  assert.equal(f.events.includes("forward:true"), false);
+  assert.equal(f.events.includes("action:wait"), true);
+});
+
+test("rejects malformed duplicate wrong-phase and wrong-ID supervisor messages", async () => {
+  const cases = [
+    { ...command("begin"), extra: true },
+    command("begin", { schema_version: true }),
+    command("finalize"),
+    command("begin", { trial_id: "other" }),
+    command("begin", { action_id: "other" }),
+    [command("begin")],
+    null,
+  ];
+  for (const first of cases) {
+    const f = fixture({ commands: [first] });
+    const result = await runParticipant(f.args);
+    assert.deepEqual(result, { schema_version: 1, status: "failed" });
+    assert.equal(f.sent.length, 1);
+    assert.equal(f.events.includes("forward:true"), false);
+  }
+  const duplicate = fixture({ commands: [command("begin"), command("begin")] });
+  assert.equal((await runParticipant(duplicate.args)).status, "failed");
+  assert.equal(duplicate.sent.length, 2);
+});
+
+test("transport failure remains fatal even when a command wait resolves", async () => {
+  for (const event of ["error", "end", "kicked"]) {
+    const f = fixture();
+    const result = await runParticipant({
+      ...f.args,
+      waitForCommand: async () => {
+        f.bot.emit(event, event === "error" ? new Error("secret") : "closed");
+        return command("begin");
+      },
+    });
+    assert.deepEqual(result, { schema_version: 1, status: "failed" });
+    assert.equal(f.events.includes("forward:true"), false);
+  }
+});
+
+test("death is not a transport failure and automatic respawn is unavailable", async () => {
+  const f = fixture();
+  const result = await runParticipant({
+    ...f.args,
+    sleep: async (ms) => {
+      assert.equal(ms, 1000);
+      f.bot.emit("death");
+    },
+    respawn: () => assert.fail("arbitrary respawn adapter must not be used"),
+  });
+  assert.equal(result.status, "protocol_completed");
+});
+
+test("never receiving begin or finalize is bounded and cleaned up", async () => {
+  const never = () => new Promise(() => {});
+  const noBegin = fixture();
+  let started = Date.now();
+  let result = await runParticipant({ ...noBegin.args, waitForCommand: never, phaseTimeoutMs: 5, totalTimeoutMs: 30 });
+  assert.equal(result.status, "failed");
+  assert.ok(Date.now() - started < 250);
+  assert.equal(noBegin.bot._client.socket.destroyed, true);
+
+  const noFinalize = fixture();
+  let calls = 0;
+  started = Date.now();
+  result = await runParticipant({
+    ...noFinalize.args,
+    phaseTimeoutMs: 5,
+    totalTimeoutMs: 30,
+    waitForCommand: () => (++calls === 1 ? command("begin") : never()),
+  });
+  assert.equal(result.status, "failed");
+  assert.ok(Date.now() - started < 250);
+  assert.equal(noFinalize.sent.length, 2);
+  assert.equal(noFinalize.bot._client.socket.destroyed, true);
+});
+
+test("late bot acquisition is disposed without running the protocol", async () => {
+  const f = fixture();
+  let resolveBot;
+  const pending = new Promise((resolve) => {
+    resolveBot = resolve;
+  });
+  const resultPromise = runParticipant({
+    ...f.args,
+    createBot: () => pending,
+    phaseTimeoutMs: 5,
+    totalTimeoutMs: 30,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  resolveBot(f.bot);
+  assert.equal((await resultPromise).status, "failed");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(f.events.includes("quit"), true);
+  assert.equal(f.bot._client.socket.destroyed, true);
+  assert.deepEqual(f.sent, []);
+});
+
+test("failure always disables forward and uses only generic diagnostic output", async () => {
+  const f = fixture();
+  const result = await runParticipant({
+    ...f.args,
+    sleep: async () => {
+      throw new Error("model or credential secret");
+    },
+  });
+  assert.deepEqual(result, { schema_version: 1, status: "failed" });
+  assert.equal(f.events.includes("forward:true"), true);
+  assert.ok(f.events.lastIndexOf("forward:false") > f.events.indexOf("forward:true"));
+  assert.doesNotMatch(JSON.stringify(result), /secret/);
+});
+
+test("API exposes no RCON, evidence, endpoint, command, or model adapter", async () => {
+  const f = fixture();
+  const result = await runParticipant({
+    ...f.args,
+    rcon: { send: () => assert.fail("must not be used") },
+    evidencePath: "/forbidden",
+    host: "example.com",
+    port: 1,
+    command: ["arbitrary"],
+    model: "forbidden",
+  });
+  assert.equal(result.status, "protocol_completed");
+  for (const message of f.sent)
+    assert.deepEqual(Object.keys(message), ["schema_version", "type", "trial_id", "action_id"]);
+});
+
+test("rejects unsafe IDs and timeout overrides outside fixed bounds", async () => {
+  const f = fixture();
+  for (const trialId of ["", "../trial", "trial\nforged", "trial-forged\n", 123])
+    await assert.rejects(() => runParticipant({ ...f.args, trialId }), /supervisor ID/);
+  await assert.rejects(() => runParticipant({ ...f.args, phaseTimeoutMs: 0 }), /phaseTimeoutMs/);
+  await assert.rejects(() => runParticipant({ ...f.args, phaseTimeoutMs: 30_001 }), /phaseTimeoutMs/);
+  await assert.rejects(() => runParticipant({ ...f.args, totalTimeoutMs: 90_001 }), /totalTimeoutMs/);
+});
+
+test("invalid and backwards runtime clocks fail generically", async () => {
+  for (const nowMonotonic of [
+    () => Number.NaN,
+    (() => {
+      let value = 1;
+      return () => value--;
+    })(),
+  ]) {
+    const f = fixture();
+    const result = await runParticipant({ ...f.args, nowMonotonic });
+    assert.deepEqual(result, { schema_version: 1, status: "failed" });
+  }
+});
+
+test("rejects a phase that resolves after its own deadline within the total budget", async () => {
+  const f = fixture();
+  let now = 0;
+  f.bot.waitForTicks = async () => {
+    now = 6;
+  };
+  const result = await runParticipant({
+    ...f.args,
+    nowMonotonic: () => now,
+    phaseTimeoutMs: 5,
+    totalTimeoutMs: 100,
+  });
+  assert.deepEqual(result, { schema_version: 1, status: "failed" });
+  assert.deepEqual(f.sent, []);
+  assert.equal(f.bot._client.socket.destroyed, true);
+});
+
+test("disposes a bot whose acquisition resolves after its phase deadline", async () => {
+  const f = fixture();
+  let now = 0;
+  const result = await runParticipant({
+    ...f.args,
+    nowMonotonic: () => now,
+    phaseTimeoutMs: 5,
+    totalTimeoutMs: 100,
+    createBot: async () => {
+      now = 6;
+      return f.bot;
+    },
+  });
+  assert.deepEqual(result, { schema_version: 1, status: "failed" });
+  assert.equal(f.events.includes("quit"), true);
+  assert.equal(f.bot._client.socket.destroyed, true);
+  assert.deepEqual(f.sent, []);
+});
+
+test("does not call bot factory when no acquisition budget remains", async () => {
+  const f = fixture();
+  let calls = 0;
+  let clockCalls = 0;
+  const result = await runParticipant({
+    ...f.args,
+    totalTimeoutMs: 10,
+    nowMonotonic: () => (clockCalls++ === 0 ? 0 : 10),
+    createBot: async () => {
+      calls += 1;
+      return f.bot;
+    },
+  });
+  assert.deepEqual(result, { schema_version: 1, status: "failed" });
+  assert.equal(calls, 0);
+});
+
+test("faulty late bot cleanup still destroys its socket without unhandled rejection", async () => {
+  const f = fixture();
+  let resolveBot;
+  const pending = new Promise((resolve) => {
+    resolveBot = resolve;
+  });
+  const unhandled = [];
+  const listener = (reason) => unhandled.push(reason);
+  process.on("unhandledRejection", listener);
+  try {
+    const resultPromise = runParticipant({
+      ...f.args,
+      createBot: () => pending,
+      phaseTimeoutMs: 5,
+      totalTimeoutMs: 30,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    f.bot.on = () => {
+      throw new Error("faulty listener adapter");
+    };
+    resolveBot(f.bot);
+    assert.equal((await resultPromise).status, "failed");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(f.bot._client.socket.destroyed, true);
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off("unhandledRejection", listener);
+  }
+});
+
+test("permission probe sends only fixed commands after begin and waits before completion", async () => {
+  const f = fixture({ movement: "stationary" });
+  f.bot.chat = (text) => f.events.push(`chat:${text}`);
+  const result = await runParticipant({ ...f.args, commandProbe: "permissions" });
+  assert.equal(result.status, "protocol_completed");
+  assert.deepEqual(
+    f.events.filter((x) => x.startsWith("chat:")),
+    ["chat:/op PilotProbe", "chat:/gamemode creative"],
+  );
+  assert.ok(f.events.indexOf("receive:begin") < f.events.indexOf("chat:/op PilotProbe"));
+  assert.ok(f.events.indexOf("chat:/gamemode creative") < f.events.indexOf("send:action_finished"));
+  assert.equal(f.events.filter((x) => x === "action:wait").length, 3);
+  assert.equal(f.events.includes("forward:true"), false);
+});
+
+test("rejects arbitrary probes or probe movement before bot creation", async () => {
+  const f = fixture();
+  for (const options of [{ commandProbe: "arbitrary" }, { commandProbe: "permissions", movement: "forward" }]) {
+    await assert.rejects(() => runParticipant({ ...f.args, ...options }), /probe/);
+  }
+  assert.equal(f.events.includes("create"), false);
+});
+
+async function socketFixture(replyAfterEnd) {
+  let peer;
+  const server = net.createServer({ allowHalfOpen: true }, (socket) => {
+    peer = socket;
+    socket.on("error", () => {});
+    socket.resume();
+    socket.on("end", () => {
+      if (replyAfterEnd) setTimeout(() => socket.end("final-server-bytes"), 30);
+    });
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const client = net.createConnection(server.address().port, "127.0.0.1");
+  await once(client, "connect");
+  let received = "";
+  client.on("data", (data) => {
+    received += data.toString();
+  });
+  client.on("error", () => {});
+  const f = fixture({ movement: "stationary" });
+  f.bot._client.socket = client;
+  f.bot.quit = () => {
+    client.end();
+  }; // Real protocol end returns void.
+  return {
+    f,
+    client,
+    received: () => received,
+    close: async () => {
+      client.destroy();
+      peer?.destroy();
+      await new Promise((resolve) => server.close(resolve));
+    },
+  };
+}
+
+test("void quit drains delayed peer bytes before successful cleanup", async () => {
+  const io = await socketFixture(true);
+  try {
+    const result = await runParticipant(io.f.args);
+    assert.equal(result.status, "protocol_completed");
+    assert.equal(io.received(), "final-server-bytes");
+    assert.equal(io.client.closed, true);
+  } finally {
+    await io.close();
+  }
+});
+
+test("peer that never closes cannot produce protocol success", async () => {
+  const io = await socketFixture(false);
+  try {
+    const result = await runParticipant({ ...io.f.args, totalTimeoutMs: 100 });
+    assert.equal(result.status, "failed");
+    assert.equal(io.client.destroyed, true);
+  } finally {
+    await io.close();
+  }
+});

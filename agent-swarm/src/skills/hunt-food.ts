@@ -1,0 +1,402 @@
+import type { Bot } from "mineflayer";
+import type { Skill, SkillResult } from "./types.js";
+import pkg from "mineflayer-pathfinder";
+const { goals } = pkg;
+import { GoalNearXZAbove, baseMoves, safeGoto, collectNearbyDrops, shedJunk } from "../bot/navigation.js";
+
+/**
+ * hunt_food — the swarm's pantry when the farm and the lake both fail.
+ *
+ * Run 517: four of five bots at 0 food, 20 deaths in an hour, 211 eat actions
+ * of which 27 found "No food in inventory" and 27 "No food animals nearby".
+ * The fishing fallback is retired (0 of 12, no string), and bread is eaten by
+ * the bakers. Animals do exist: this map's herds graze 60 to 200 blocks out,
+ * past the 80-block range a bot perceives. This skill goes and gets one:
+ * scout outward along one committed heading in daylight until a food animal
+ * is in sight, kill it, sweep the drops, and eat on the spot.
+ */
+
+const FOOD_ANIMALS = new Set(["cow", "pig", "sheep", "chicken", "rabbit", "mooshroom"]);
+const MEAT =
+  /^(beef|porkchop|mutton|chicken|rabbit|cooked_beef|cooked_porkchop|cooked_mutton|cooked_chicken|cooked_rabbit)$/;
+
+// Hunger per raw drop: beef and porkchop 3, mutton and rabbit 3 (rabbit only
+// half the time), chicken 2 and a poisoning chance. A cow 60 blocks out beats
+// a chicken 20 blocks out (run 523: two kills, one mutton and one chicken,
+// took Mason from 0 to 2 and back to 0 by the walk home).
+const VALUE: Record<string, number> = { cow: 3, mooshroom: 3, pig: 3, sheep: 2, rabbit: 1.5, chicken: 1 };
+const FUEL = new Set([
+  "coal",
+  "charcoal",
+  "oak_log",
+  "birch_log",
+  "spruce_log",
+  "oak_planks",
+  "birch_planks",
+  "spruce_planks",
+]);
+const RAW_TO_COOKED: Record<string, string> = {
+  beef: "cooked_beef",
+  porkchop: "cooked_porkchop",
+  mutton: "cooked_mutton",
+  chicken: "cooked_chicken",
+  rabbit: "cooked_rabbit",
+};
+
+export function nearestFoodAnimal(bot: Bot, exclude?: Set<number>) {
+  let best: ReturnType<Bot["nearestEntity"]> = null;
+  let bestScore = 0;
+  for (const e of Object.values(bot.entities)) {
+    const v = VALUE[e.name ?? ""];
+    if (!v) continue;
+    if (exclude?.has(e.id)) continue;
+    const d = e.position.distanceTo(bot.entity.position);
+    if (d > 96) continue;
+    const score = v / (1 + d / 40);
+    if (score > bestScore) {
+      bestScore = score;
+      best = e;
+    }
+  }
+  return best;
+}
+
+/** Cook the raw meat aboard in a furnace already standing within 12 blocks,
+ *  when the bot carries fuel. Doubles the hunger per drop (cooked beef 8,
+ *  cooked mutton 6). Bounded: at most three items, 40 seconds. */
+async function cookIfEasy(bot: Bot, signal: AbortSignal): Promise<number> {
+  const raw = bot.inventory.items().find((i) => RAW_TO_COOKED[i.name]);
+  const fuel = bot.inventory.items().find((i) => FUEL.has(i.name));
+  if (!raw || !fuel) return 0;
+  const furnace = bot.findBlock({ matching: (b) => b.name === "furnace" || b.name === "lit_furnace", maxDistance: 12 });
+  if (!furnace) return 0;
+  try {
+    await safeGoto(bot, new goals.GoalNear(furnace.position.x, furnace.position.y, furnace.position.z, 2), 15_000);
+    const f = (await Promise.race([
+      bot.openFurnace(furnace),
+      new Promise((_, rej) => setTimeout(() => rej(new Error("openFurnace timeout")), 10_000)),
+    ])) as Awaited<ReturnType<typeof bot.openFurnace>>;
+    try {
+      if (f.outputItem()) await f.takeOutput();
+      const n = Math.min(3, raw.count);
+      const fuelNeeded = fuel.name === "coal" || fuel.name === "charcoal" ? 1 : n;
+      if (!f.fuelItem()) await f.putFuel(fuel.type, null, Math.min(fuelNeeded, fuel.count));
+      if (!f.inputItem()) await f.putInput(raw.type, null, n);
+      const until = Date.now() + n * 10_500 + 3_000;
+      while (Date.now() < until && !signal.aborted) {
+        await new Promise((r) => setTimeout(r, 2_500));
+        const out = f.outputItem();
+        if (out && out.count >= n) break;
+      }
+      const out = f.outputItem();
+      if (out) await f.takeOutput();
+      return out?.count ?? 0;
+    } finally {
+      f.close();
+    }
+  } catch (e) {
+    console.log(`[HuntDebug] ${bot.username} cooking skipped: ${(e as Error).message}`);
+    return 0;
+  }
+}
+
+function countMeat(bot: Bot): number {
+  return bot.inventory
+    .items()
+    .filter((i) => MEAT.test(i.name))
+    .reduce((s, i) => s + i.count, 0);
+}
+
+/** Eat what was just gathered until hunger is comfortable. Raw meat is fine
+ *  for a starving bot (3 to 4 hunger each); cooking can wait. */
+async function eatMeat(bot: Bot, signal: AbortSignal): Promise<number> {
+  let eaten = 0;
+  for (let i = 0; i < 4 && bot.food < 18 && !signal.aborted; i++) {
+    const meat = bot.inventory.items().find((it) => MEAT.test(it.name));
+    if (!meat) break;
+    try {
+      await bot.equip(meat, "hand");
+      await bot.consume();
+      eaten++;
+    } catch {
+      break;
+    }
+  }
+  return eaten;
+}
+
+/** Per-bot scouting memory: headings that found nothing, and the last spot an animal was seen. */
+const huntMemory = new Map<string, { failed: string[]; animalSpot?: { x: number; y: number; z: number } }>();
+
+export const huntFoodSkill: Skill = {
+  name: "hunt_food",
+  description:
+    "Find a food animal (cow, pig, sheep, chicken, rabbit), scouting outward in daylight if none is in sight, kill it, collect the meat and eat it. The pantry of last resort when starving.",
+  params: {},
+
+  estimateMaterials(): Record<string, number> {
+    return {};
+  },
+
+  async execute(bot, _params, signal, onProgress): Promise<SkillResult> {
+    const step = (message: string, progress: number) =>
+      onProgress({ skillName: "hunt_food", phase: "Hunt", progress, message, active: true });
+
+    const foodBefore = bot.food;
+    bot.pathfinder.setMovements(baseMoves(bot));
+
+    // A full pocket cannot pick the drop up. Shed mining junk first.
+    // Run 655: a builder's pack full of planks and seeds has no "junk" to
+    // toss, and the porkchop stayed on the ground. Make room for meat from
+    // bulk too.
+    if (bot.inventory.emptySlotCount() < 2) {
+      await shedJunk(bot, 2, true).catch(() => {});
+    }
+
+    // Already carrying meat: eat it and go home happy.
+    if (countMeat(bot) > 0 && bot.food < 18) {
+      const eaten = await eatMeat(bot, signal);
+      if (eaten > 0) {
+        return { success: true, message: `Ate ${eaten} meat from the pack. Hunger ${foodBefore} -> ${bot.food}.` };
+      }
+    }
+
+    let target = nearestFoodAnimal(bot);
+
+    // Nothing in sight: scout along one committed heading, three hops of
+    // sixty blocks, rescanning after each. Daylight only. At night the walk
+    // out is a walk into skeletons, which is how the breeding scout died
+    // repeatedly before it got its daylight gate.
+    if (!target) {
+      if (!bot.time.isDay) {
+        return { success: false, message: "No food animal in sight and it is night. Hunt again at daybreak." };
+      }
+      // Remember what worked. Runs 577 to 581: 12 to 13 empty hunts an hour
+      // near the village, each a random heading of three hops, while the
+      // kills came 300 blocks out. A bot now walks toward the last spot an
+      // animal was seen when one is known, otherwise picks a heading it has
+      // not tried and goes five hops. Hops stay on the surface (y floor 60):
+      // the old XZ goal walked scouts down into caves.
+      const mem = huntMemory.get(bot.username) ?? { failed: [] as string[] };
+      huntMemory.set(bot.username, mem);
+      const cardinals: Array<[number, number]> = [
+        [1, 0],
+        [0, 1],
+        [-1, 0],
+        [0, -1],
+      ];
+      const p0 = bot.entity.position;
+      const spot = mem.animalSpot;
+      const spotGap = spot ? Math.hypot(spot.x - p0.x, spot.z - p0.z) : Infinity;
+      let ddx: number;
+      let ddz: number;
+      if (spot && spotGap > 24 && spotGap < 400) {
+        ddx = (spot.x - p0.x) / spotGap;
+        ddz = (spot.z - p0.z) / spotGap;
+        console.log(
+          `[HuntDebug] ${bot.username} scouting toward the last animal spot (${spot.x}, ${spot.z}), ${Math.round(spotGap)} blocks`,
+        );
+      } else {
+        const untried = cardinals.filter((c) => !mem.failed.includes(c.join(",")));
+        const pick = (untried.length ? untried : cardinals)[
+          Math.floor(Math.random() * (untried.length ? untried.length : 4))
+        ];
+        if (!untried.length) mem.failed = [];
+        [ddx, ddz] = pick;
+        console.log(
+          `[HuntDebug] ${bot.username} scouting heading (${ddx}, ${ddz}); tried ${mem.failed.length ? mem.failed.join(" ") : "none"}`,
+        );
+      }
+      const HOPS = 5;
+      for (let hop = 0; hop < HOPS && !target && !signal.aborted; hop++) {
+        const p = bot.entity.position;
+        step(`Scouting for animals (hop ${hop + 1}/${HOPS})...`, 0.1 + hop * 0.08);
+        await safeGoto(bot, new GoalNearXZAbove(p.x + ddx * 60, p.z + ddz * 60, 6, 60), 45_000, 12_000).catch(() => {});
+        target = nearestFoodAnimal(bot);
+      }
+      if (!target) {
+        if (!spot || spotGap >= 400) mem.failed.push(`${Math.round(ddx)},${Math.round(ddz)}`);
+        else mem.animalSpot = undefined;
+        return {
+          success: false,
+          message: `Scouted ${HOPS * 60} blocks and saw no food animal. Try another heading next time.`,
+        };
+      }
+      mem.animalSpot = {
+        x: Math.round(target.position.x),
+        y: Math.round(target.position.y),
+        z: Math.round(target.position.z),
+      };
+    } else {
+      const mem = huntMemory.get(bot.username) ?? { failed: [] as string[] };
+      mem.animalSpot = {
+        x: Math.round(target.position.x),
+        y: Math.round(target.position.y),
+        z: Math.round(target.position.z),
+      };
+      huntMemory.set(bot.username, mem);
+    }
+
+    const weapon =
+      bot.inventory.items().find((i) => i.name.endsWith("_sword")) ??
+      bot.inventory.items().find((i) => i.name.endsWith("_axe")) ??
+      bot.inventory.items().find((i) => i.name.endsWith("_pickaxe"));
+    if (weapon) await bot.equip(weapon, "hand").catch(() => {});
+
+    // One kill is a snack (2 to 3 hunger raw) and the walk home eats it. Keep
+    // hunting while animals are in sight, up to three kills or a decent meal.
+    const meatBefore = countMeat(bot);
+    const outingUntil = Date.now() + 150_000;
+    let kills = 0;
+    let swings = 0;
+    let misses = 0;
+    let lost = 0;
+    // Run 640: four hunts ended "got away after 1 swing" with 45 s of chase
+    // each. Count the follow walks that failed and keep the last error so
+    // the next change knows whether the chase loses on speed or on paths.
+    let followFails = 0;
+    let lastFollowErr = "";
+    let lastGap = 0;
+    // Run 678: 8 of 13 failed hunts were "got away after 0 swings" on sheep
+    // and chickens 70 to 89 blocks out whose follow walk ended in "No path",
+    // "Navigation timed out" or "Stuck" (across a river, on the far bank).
+    // The loop then re-picked the same animal until the clock ran out. An
+    // animal whose approach fails on a path error is dropped for this outing.
+    const unreachable = new Set<number>();
+    let lastSpecies = target.name ?? "animal";
+    let escaped = false;
+    // Natural healing only runs at 18 food or more, so an outing that stops
+    // at 6 to 11 leaves a bot at one heart for hours (run 536: Forge and
+    // Atlas parked at 1 hp for an hour with food 10 to 12). Keep hunting
+    // while the meat aboard cannot lift hunger to 18.
+    const projected = () => bot.food + 3 * countMeat(bot);
+    while (target && kills < 6 && projected() < 18 && Date.now() < outingUntil && !signal.aborted) {
+      const species = target.name ?? "animal";
+      lastSpecies = species;
+      const startDist = bot.entity.position.distanceTo(target.position);
+      step(`Hunting a ${species} (${startDist.toFixed(0)} blocks away)...`, 0.5 + kills * 0.1);
+      // Run 660: eight hunts ended "got away after 0 or 1 swings" with the
+      // animal 0.3 to 1.5 blocks away. The 45 s budget started before a 92
+      // block approach, so the bot arrived with seconds left. The approach
+      // gets its own 45 s; the fight clock starts on first contact.
+      let fightUntil = Date.now() + 45_000;
+      let engaged = false;
+      // Run 626: "Killed 6 sheep but picked up no meat" with 7 swings. A
+      // target that left the client's view counted as a kill, and swings
+      // landed out of reach after the animal moved off during the follow.
+      // Same shape the spider hunt fixed in run 615: close to 1.2, look at
+      // it, swing only inside three blocks, and count a kill only when the
+      // animal vanished within six blocks.
+      let lastDist = bot.entity.position.distanceTo(target.position);
+      // Run 627: two sheep "died" in three swings and a pig in one, with no
+      // meat, so some kills are still the client dropping the entity. Track
+      // the last health seen to size the next rule.
+      const hpOf = (e: typeof target) => {
+        const m = (e as unknown as { metadata?: unknown[] }).metadata;
+        const v = Array.isArray(m) ? m[9] : undefined;
+        return typeof v === "number" ? v : NaN;
+      };
+      let lastHp = hpOf(target);
+      try {
+        while (target.isValid && Date.now() < fightUntil && !signal.aborted) {
+          const gap = bot.entity.position.distanceTo(target.position);
+          if (gap > 2.5) {
+            // Run 641: every failed chase was "Navigation timed out" on an
+            // animal 36 to 74 blocks away; eight seconds restarts the walk
+            // before it gets there, five times over. Give a far animal up to
+            // thirty seconds for the approach; a near one keeps eight.
+            const walkMs = Math.min(30_000, 8_000 + Math.round(gap) * 400);
+            let pathFail = false;
+            await safeGoto(bot, new goals.GoalFollow(target, 1.2), walkMs).catch((e: Error) => {
+              followFails++;
+              lastFollowErr = e.message.slice(0, 60);
+              pathFail = /No path|timed out|Stuck/i.test(e.message);
+            });
+            const stillFar = bot.entity.position.distanceTo(target.position) > 12;
+            if (pathFail && stillFar && !engaged) {
+              unreachable.add(target.id);
+              console.log(
+                `[HuntDebug] ${bot.username} cannot reach the ${species} ${stillFar ? Math.round(bot.entity.position.distanceTo(target.position)) : 0} blocks out (${lastFollowErr}); trying another animal`,
+              );
+              break;
+            }
+          }
+          if (!target.isValid) break;
+          lastDist = bot.entity.position.distanceTo(target.position);
+          lastGap = lastDist;
+          lastHp = hpOf(target);
+          if (!engaged && lastDist <= 3.0) {
+            engaged = true;
+            fightUntil = Date.now() + 45_000;
+          }
+          if (lastDist > 3.0) {
+            misses++;
+            await new Promise((r) => setTimeout(r, 300));
+            continue;
+          }
+          await bot.lookAt(target.position.offset(0, 0.5, 0), true).catch(() => {});
+          await bot.attack(target);
+          swings++;
+          // Full attack-cooldown charge between swings (1.21 scales damage by charge).
+          await new Promise((r) => setTimeout(r, 1150));
+        }
+        await collectNearbyDrops(bot, 8, 7000);
+      } catch {
+        /* best effort; the deltas below are the verdict */
+      }
+      if (target.isValid && unreachable.has(target.id)) {
+        target = nearestFoodAnimal(bot, unreachable);
+        if (!target) {
+          lastSpecies = species;
+          break;
+        }
+        continue;
+      }
+      if (target.isValid) {
+        escaped = true;
+        break;
+      }
+      if (lastDist > 6) {
+        lost++;
+        console.log(
+          `[HuntDebug] ${bot.username} lost sight of the ${species} at ${lastDist.toFixed(1)} blocks (no kill)`,
+        );
+      } else {
+        kills++;
+        console.log(
+          `[HuntDebug] ${bot.username} ${species} gone at ${lastDist.toFixed(1)} blocks, last hp ${Number.isNaN(lastHp) ? "?" : lastHp.toFixed(1)}, swings so far ${swings}`,
+        );
+      }
+      target = nearestFoodAnimal(bot, unreachable);
+    }
+
+    const gained = countMeat(bot) - meatBefore;
+    step("Cooking what is easy, then eating...", 0.9);
+    const cooked = gained > 0 ? await cookIfEasy(bot, signal) : 0;
+    const eaten = gained > 0 ? await eatMeat(bot, signal) : 0;
+    // The food packet lands a moment after consume() resolves (run 536:
+    // "ate 4, hunger 0 -> 0" while RCON read food 12 seconds later).
+    await new Promise((r) => setTimeout(r, 800));
+    console.log(
+      `[HuntDebug] ${bot.username} food hunt: kills=${kills} lost=${lost} last=${lastSpecies} swings=${swings} outOfReach=${misses} followFails=${followFails} lastGap=${lastGap.toFixed(1)}${lastFollowErr ? ` lastErr="${lastFollowErr}"` : ""} ` +
+        `meat +${gained} cooked=${cooked} ate=${eaten} hunger ${foodBefore}->${bot.food}`,
+    );
+    if (gained > 0) {
+      return {
+        success: true,
+        message: `Killed ${kills} animal${kills === 1 ? "" : "s"}: +${gained} meat, cooked ${cooked}, ate ${eaten}. Hunger ${foodBefore} -> ${bot.food}.`,
+        stats: { meat: gained, eaten, kills },
+      };
+    }
+    if (kills > 0) {
+      return { success: false, message: `Killed ${kills} ${lastSpecies} but picked up no meat.` };
+    }
+    if (!escaped && unreachable.size && kills === 0) {
+      return {
+        success: false,
+        message: `No reachable food animal: ${unreachable.size} ${lastSpecies}${unreachable.size > 1 ? "s" : ""} in view but every approach failed on a path (${lastFollowErr || "no path"}). Scout another heading.`,
+      };
+    }
+    return { success: false, message: escaped ? `The ${lastSpecies} got away after ${swings} swings.` : "No kill." };
+  },
+};

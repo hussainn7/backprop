@@ -1,0 +1,221 @@
+# 2026-06-11 — Session: CI fix, environment revival, team coordination
+
+Goal: get the project working again after ~6 weeks idle, fix the failing GitHub
+run, modernize models/deps, and get the bot team visibly accomplishing things.
+
+## Successes
+
+### 1. CI fixed (main is green again)
+- Root cause: PR #21 (unit tests) and PR #22 (Prettier config) merged in
+  parallel — four test files were never formatted with the new config, so the
+  `format:check` step failed on every push since the merge.
+- Also bumped `actions/checkout` and `actions/setup-node` to v5 ahead of the
+  June 16 Node-20 runner deprecation.
+
+### 2. The "broken project" was mostly a VRAM squatter
+- A forgotten ComfyUI instance (running since the day before, port 8188) held
+  **21 GB of the RTX 5090's 32 GB**. Ollama fell back to 70% CPU and
+  `qwen3:32b` generated at **4 tok/s** — decisions took up to 2 minutes, which
+  reads as "bots are brain-dead."
+- After freeing VRAM: `qwen3:32b` 65 tok/s, `qwen3.6:35b-a3b` **147 tok/s**,
+  `qwen3:8b` 211 tok/s.
+
+### 3. Model modernization — one MoE for everything
+- Switched both `OLLAMA_MODEL` and `OLLAMA_FAST_MODEL` to `qwen3.6:35b-a3b`
+  (MoE, ~3B active params). Faster than the old dense-32b strategic path AND
+  smarter than the old 8b reactive path.
+- Two models don't fit in 32 GB together (MoE alone reserves 26-27 GB); a
+  single resident model eliminates 3-13s eviction/reload thrash per swap.
+- Added `format: "json"` to all decision-path Ollama calls — kills the
+  malformed-JSON failure class. NOTE: full JSON-schema constrained output is
+  silently ignored for qwen3.6 on ollama 0.20.2 (returns prose).
+
+### 4. Team coordination bugs fixed (observed live, then fixed)
+Observed a full 5-bot session before changing anything. Failure patterns:
+- `stashPos` was `undefined` for every bot → every `deposit_stash` failed and
+  `setup_stash` got hallucinated coordinates. Fix: shared `STASH_POS` constant;
+  brain injects real coords into `setup_stash`.
+- **Capability deadlock**: Mason's #1 priority needs logs, but no action he was
+  allowed to use could produce logs. Fix: Mason gets `gather_wood`.
+- Bots couldn't hear each other (all bot chat filtered) — Mason literally asked
+  Flora for planks and she never received it. Fix: bots hear teammates who
+  address them **by name**, 45s per-sender cooldown to prevent loops.
+- LLM kept emitting param-less actions (`place_block` with no blockType,
+  `chat` with no message → said "undefined" in game). Fix: per-action param
+  signatures in the strategic prompt + hard errors instead of garbage output.
+- `setup_stash` now ground-snaps Y so chests don't float/bury.
+
+### 5. Dependency updates + a phantom dependency unmasked
+- `npm update`: mineflayer 4.34→4.37.1, custom-pvp 1.7.16, tooling bumps.
+- This **broke craft**: `minecraft-data` was imported directly but never
+  declared in package.json. The update re-hoisted node_modules and the root
+  copy became the ancient 2.221.0 (from mineflayer-trajectories), which
+  doesn't know MC 1.21.4 → `Cannot read properties of null (itemsByName)`.
+  Fix: declare `minecraft-data@^3.110.2` explicitly.
+
+## Failures / open issues
+- Ollama 0.20.2 + qwen3.6: JSON-schema `format` silently ignored (prose
+  comes back). Plain `format:"json"` works. Re-test after ollama upgrade —
+  schema mode would let us constrain `action` to an enum of allowed actions.
+- Pathfinder still times out on some goals ("Navigation timed out") — bots
+  recover via critic re-plan, but it wastes turns.
+- Dynamic skill `collectBamboo` hit the minecraft-data null too (fixed by the
+  phantom-dep fix).
+
+## Experiment log
+- **Run 1** (old code, 5 bots): bots role-play well, Forge mines, Atlas
+  explores, but stash coordination 100% broken; Mason deadlocked; bot-to-bot
+  chat unheard.
+- **Run 2** (coordination fixes): aborted early — dep update broke craft
+  mid-run (phantom dep).
+- **Run 3** (all fixes): clean start, wiped bot playerdata + inventories.
+  Season goal injected via temporary "Director" connection using `!goal set`:
+  *"Build a village at The Stash (286, 70, -314): stash chests, a wood house,
+  a wheat farm, torches at night, stock the stash, defend the site."*
+
+- **Run 3 result (~15 min)**: net team assets were 3 logs + 12 dirt. Bots
+  role-played beautifully but produced almost nothing. Ground-truth inventory
+  check via RCON (`data get entity <bot> Inventory`) exposed the root cause:
+
+### 6. THE big one — bots never picked up their drops
+`gather_wood` / `mine_block` / build-skill material gathering all did
+`bot.dig(block)` and reported success immediately. The drop stayed on the
+ground. Bots "gathered 5 logs" with empty inventories, then every craft
+failed, and the LLM reasoned correctly from false observations — which looks
+exactly like "the bot is dumb." Fixed with `collectNearbyDrops()` (walk to
+item entities after digging) + inventory-delta verification in gather_wood.
+`mineflayer-collectblock` was in package.json all along but never loaded.
+
+- **Run 4**: drop collection v1 still failed ("Chopped 5 logs but couldn't
+  pick up the drops") — the collector gave up on ALL drops at the first
+  unreachable one, and chased drops that were still falling. The new honest
+  result message made the failure visible immediately, which v1's
+  predecessor ("Gathered 5 logs!") had been hiding all along.
+- **Drop collection v2**: per-drop retry with a tried-set, 800ms settle
+  delay, GoalBlock (stand ON the drop) instead of GoalNear r=1. Verified
+  live with a probe bot + RCON-summoned drops: **5/6 collected** (v1: 0/6).
+- **Run 5**: wood pickup confirmed live ("Atlas: Gathered 5 logs" → 16
+  oak_planks in real inventory). New problem class exposed: **Forge
+  strip-mined the village site into pits and Mason fell in and was
+  permanently stuck** — safeMoves can neither dig nor tower, so every go_to
+  failed forever.
+- **Fixes**: go_to rescue retry (dig + 1x1 towers when safe movement finds
+  no path); mine_block refuses blocks within 12 of The Stash; RCON-filled
+  the existing pits.
+- **Run 6 — the breakthrough run**: full economy chain worked end to end:
+  logs → planks → sticks → crafting table → **wooden pickaxe + axe**
+  (first tools ever), house built to 76/174 blocks ("It has... character"),
+  and Mason **deposited 17 items at the stash chest**. Bot-to-bot name
+  mentions and viewer steering (Director chat) both functioned.
+- Remaining LLM weakness: Mason never chose setup_stash on his own (placed
+  chests by hand instead). Added a deterministic stash-bootstrap override in
+  the brain — same pattern as the leash override.
+- **Run 7 (~3.5 hours unattended)**: the longest stable run ever for this
+  project. Ground-truth census at the end:
+  - **Working stash economy**: dozens of deposit/withdraw cycles (deposits of
+    40, 21, 20, 18, 17, 14... items; withdrawals of logs, planks, even a
+    crafting table). The stash chest **filled to capacity** — the team
+    out-produced its own storage.
+  - 3 chests + house structure at the village; tools crafted repeatedly.
+  - Real bot-to-bot trade negotiation in chat (Blade demanding planks from
+    Atlas for "Stash defense", Flora coordinating pickaxe crafting).
+  - One bot death in ~3.5h; auto-respawn worked; zero process crashes.
+  - Comedy finding: the team hoarded **46 sticks** — LLM crafting loops
+    over-produce intermediate goods. Strategy targeting, not mechanics, is
+    now the weakest layer.
+- **Run 7 defects fixed for run 8**:
+  - `chatWithLLM` was missing `think:false` — qwen3.6 spent its whole token
+    budget thinking and every conversational reply was empty ("Hmm...").
+  - `setup_stash` no-opped when a chest existed even if full; bots spammed
+    it while deposits reported "stash needs expansion". Now it checks
+    fullness and places an additional chest.
+- **Run 8**: running with all fixes; Flora directed to the lake for the
+  wheat farm, Mason directed to finish the house.
+
+## Self-improvement assessment (honest)
+**Infrastructure exists, loop is open.** Memory tracks 354 skill attempts
+with success rates and the Voyager-style generate_skill/dynamic-loader
+pipeline works (63 generated skills). But nothing CONSUMES the stats:
+craftWoodenPickaxe is 1/56 across the team and keeps being retried;
+craft_gear (built-in) is 0/36. "Broken-skill" detection excludes
+precondition failures, so material-starved skills retry forever — many of
+those preconditions were caused by the now-fixed drop-collection bug, so
+rates should improve. No curriculum, no skill refinement on failure, no
+retrieval beyond "first 8 names in the prompt".
+
+## Roadmap from external research (Voyager / mindcraft / MineCollab)
+1. **Close the skill loop (Voyager)**: on skill failure, feed the error +
+   code back to the LLM to REFINE the skill (iterative prompting); only
+   library successful versions. Add semantic retrieval over the library
+   instead of listing 8 names.
+2. **Skill curation from existing stats**: weekly prune/repair pass driven
+   by memory skillHistory; surface per-skill success rates into the
+   strategic prompt so bots prefer what works.
+3. **Automatic curriculum (Voyager)**: propose next tasks from inventory +
+   discoveries instead of a fixed priority list — measurable progression
+   (wood age → stone → iron → diamond) is also perfect stream content.
+4. **Self-improvement metric**: track tech-tree milestones per session
+   (time-to-first-tool, time-to-iron, deaths/hour, stash throughput) in a
+   session scoreboard file; plot across sessions to SHOW improvement.
+5. **mindcraft (kolbytn) techniques**: profile-driven agents, MineCollab
+   collaboration benchmark; Sweaterdog's Andy models prove local-model
+   fine-tuning on bot trajectories works — Jesse's RTX 5090 could LoRA a
+   small model on this team's own successful action sequences (the
+   stated long-term goal).
+
+## Final state of the codebase (all pushed to main, CI green)
+13 commits this session. Highlights: working drop collection, stash economy,
+rescue pathfinding, protected village zone, deterministic stash bootstrap,
+single-MoE model config, phantom-dep fix, bot-to-bot chat, JSON-constrained
+decisions, honest action reporting.
+
+## Recommendations for Jesse
+- Upgrade Ollama (needs sudo): `curl -fsSL https://ollama.com/install.sh | sh`
+  (0.20.2 → 0.30.x). Then re-test JSON-schema outputs; if fixed, constrain
+  `action` to each bot's allowlist enum and delete a whole class of prompt
+  nudging.
+- ComfyUI was stopped this session to free 21 GB VRAM — restart it if needed,
+  but don't leave it running while bots stream.
+
+(continued below as the session progresses)
+
+## Self-improvement implementation (evening session)
+All five roadmap items implemented, each as its own commit (revert any one
+independently if scoreboards regress):
+1. `scoreboard.ts` — per-session metrics + tech milestones (logs/sessions/)
+2. `reliability.ts` — team-wide skill stats; retire ≥8-attempt <10% skills;
+   prompt list ranked/annotated by success rate
+3. `curriculum.ts` — TECH TREE next-milestone injection (first session
+   milestones: first_planks 27s, first_log/table/tool 38s)
+4. `refineSkill()` — Voyager loop: code-error failures send source+error
+   back to the LLM for a fix (.bak kept, 2 attempts/session cap)
+5. `trajectory.ts` + `finetune/` — training data accumulates passively;
+   overnight LoRA recipe in finetune/README.md with scoreboard-based A/B.
+Viewer bot-switch bug also fixed (worker world-reset race; 195 errors → 0).
+
+## Overnight fine-tune (v1) — 2026-06-12 ~01:00
+- Dataset: 1,385 balanced examples (action-capped) from 4,040 trajectories.
+- Qwen3-8B QLoRA via unsloth on the 5090: loss 2.53 → 0.19 over 2 epochs,
+  51 min. Two snags fixed: (1) missing gradient checkpointing overflowed
+  32GB and spilled to WSL2 shared memory (42-700s/step → 18s/step);
+  (2) bare-FROM ollama Modelfile fell back to raw prompt concatenation —
+  the model echoed prompts. Fixed with an explicit ChatML TEMPLATE matching
+  the training render (empty <think> block).
+- Registered as qwen3-minecraft:8b (q8_0, 8.7GB — vs the MoE's 27GB).
+  138 tok/s, sub-second strategic decisions, valid JSON, in-character.
+- Run 17 launched with the fine-tune as BOTH models. First decisions: 0
+  JSON failures, working critic + team chat. Scoreboard will judge it vs
+  the MoE baseline sessions; revert = one line in .env.
+
+## 2026-06-13: Wheat farm finally built (the 19-restart bug)
+The farm — the last unmet village goal — is built and RCON-verified: 3 wheat
+crops growing on farmland at (272,65) by the natural water pool near the
+village. Root cause of ~19 failed attempts: build_farm's "surface water only"
+findBlock predicate called bot.blockAt INSIDE the matcher, which makes
+mineflayer's findBlock silently return null for everything. Every other "fix"
+(travel, chunk-load, coordinates, override gating, day-gate, irrigation bed)
+addressed real-but-secondary issues; a one-line console.log of the bot's
+position + a plain-matcher water result finally exposed it. Lesson saved to
+memory ([[findblock-predicate-trap]]). Also this session: explore made a
+universal action (gated-action waste 27%->8%), give_item verified handoffs,
+chat dedup, observation-verb aliasing.

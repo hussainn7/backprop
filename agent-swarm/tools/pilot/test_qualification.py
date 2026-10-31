@@ -1,0 +1,323 @@
+import hashlib, json, os, tempfile, unittest
+from pathlib import Path
+from unittest import mock
+from tools.pilot.qualification import run_qualification, QualificationError, QUAL_PROPERTIES
+from tools.pilot.server import ProcessResult
+LIFE = {'schema_version': 1, 'status': 'passed', 'readiness': 'ready', 'client': 'exited', 'client_returncode': 0, 'java_returncode': 0, 'stop_sent': True, 'term_sent': False, 'kill_sent': False}
+
+def evidence(mode="forward", passed=True):
+    distance = 1.0 if mode == "forward" else 0.0
+    return {
+        "schemaVersion": 1,
+        "status": "passed" if passed else "failed",
+        "claimsLiveBenchmarkResult": False,
+        "endpoint": {"host": "127.0.0.1", "gamePort": 25585, "rconPort": 25595},
+        "username": "PilotProbe",
+        "minecraftVersion": "1.21.4",
+        "movementMode": mode,
+        "handshakeSent": True,
+        "before": {
+            "position": {"x": 0, "y": 64, "z": 0},
+            "dimension": "minecraft:overworld",
+            "health": 20,
+        },
+        "after": {
+            "position": {"x": distance, "y": 64, "z": 0},
+            "dimension": "minecraft:overworld",
+            "health": 20,
+        },
+        "mineflayer": {
+            "before": {"x": 0, "y": 64, "z": 0},
+            "after": {"x": distance, "y": 64, "z": 0},
+        },
+        "checks": {
+            "transportIntact": True,
+            "initialPositionsAgree": True,
+            "terminalSettled": True,
+        },
+    }
+
+class Tests(unittest.TestCase):
+
+    def setUp(self):
+        self.t = tempfile.TemporaryDirectory()
+        self.root = Path(self.t.name)
+        self.tools = self.root / 'tools'
+        (self.tools / 'bin').mkdir(parents=True)
+        (self.tools / 'node_modules').mkdir()
+        (self.tools / 'bin/node').write_text('node')
+        (self.tools / 'qualification-client.mjs').write_text('client')
+
+    def tearDown(self):
+        self.t.cleanup()
+
+    def restore(self, output, **kw):
+        output.mkdir(mode=448)
+        os.chmod(output, 448)
+        (output / 'server.properties').write_text('base')
+        os.chmod(output / 'server.properties', 384)
+        (output / 'runtime-manifest.json').write_text('{}')
+        os.chmod(output / 'runtime-manifest.json', 384)
+        return {'snapshot_sha256': 'a' * 64, 'server_jar_sha256': 'b' * 64}
+
+    def result(self, code=0, **kw):
+        return ProcessResult('exited', code, None, kw.get('timed_out', False), False, False, False, False, kw.get('uncertain', False), b'', b'', kw.get('truncated', False), False, 0.1)
+
+    def runner(self, life=LIFE, ev=None, code=0):
+
+        def run(argv, **kw):
+            for name, value in [('qualification-evidence.json', ev or evidence()), ('namespace-result.json', life)]:
+                p = kw['cwd'] / name
+                p.write_text(json.dumps(value))
+                os.chmod(p, 384)
+            self.argv = argv
+            return self.result(code)
+        return run
+
+    def raw_runner(self, raw_evidence, code=0):
+        def run(argv, **kw):
+            evidence_path = kw["cwd"] / "qualification-evidence.json"
+            evidence_path.write_bytes(raw_evidence)
+            os.chmod(evidence_path, 384)
+            life = kw["cwd"] / "namespace-result.json"
+            life.write_text(json.dumps(LIFE))
+            os.chmod(life, 384)
+            return self.result(code)
+        return run
+
+    def call(self, name='work', **kw):
+        with mock.patch('tools.pilot.qualification.restore_mod.verify_runtime', return_value={}), mock.patch('tools.pilot.qualification.verify_tools', return_value={}):
+            return run_qualification(workspace=self.root / name, restore_kwargs={}, tool_snapshot=self.tools, tool_manifest_sha256='c' * 64, restore_fn=self.restore, validate_executables=False, **kw)
+
+    def test_fixed_contract_private_and_hashed(self):
+        report = self.call(runner=self.runner())
+        self.assertEqual(report['status'], 'completed')
+        self.assertIn('--unshare-net', self.argv)
+        self.assertNotIn('rcon.password', ' '.join(self.argv))
+        self.assertEqual(len(report['evidence_sha256']), 64)
+        self.assertTrue(report['evidence_valid_for_requested_mode'])
+        self.assertTrue(report['namespace_lifecycle_valid_for_requested_mode'])
+        self.assertFalse(report['independent_observer_process'])
+        self.assertFalse((self.root / 'work/runtime/.qualification-rcon-password').exists())
+        self.assertEqual((self.root / 'work').stat().st_mode & 511, 448)
+        self.assertIn(QUAL_PROPERTIES, (self.root / 'work/runtime/server.properties').read_text())
+        self.assertTrue(report['qualification_config']['retained_private_rcon_credential'])
+
+    def test_lifecycle_false_positive_never_completes(self):
+        for i, patch in enumerate([{'java_returncode': 1}, {'term_sent': True}, {'stop_sent': False}, {'status': 'passed', 'readiness': 'timeout'}]):
+            life = {**LIFE, **patch}
+            report = self.call(f'f{i}', runner=self.runner(life=life))
+            self.assertEqual(report['status'], 'failed')
+            self.assertFalse(report['namespace_lifecycle_valid_for_requested_mode'])
+            self.assertTrue(report['evidence_valid_for_requested_mode'])
+
+    def test_stationary_is_recorded_negative_control_and_flagged(self):
+        life = {**LIFE, 'status': 'failed', 'client_returncode': 1}
+        report = self.call('stationary', movement_mode='stationary', runner=self.runner(life=life, ev=evidence('stationary', False), code=1))
+        self.assertEqual(report['status'], 'failed')
+        self.assertTrue(report['negative_control_observed'])
+        self.assertTrue(report['evidence_valid_for_requested_mode'])
+        self.assertTrue(report['namespace_lifecycle_valid_for_requested_mode'])
+        self.assertEqual(self.argv[-1], 'stationary')
+
+    def test_stationary_large_motion_or_transport_failure_is_not_a_control(self):
+        life = {**LIFE, "status": "failed", "client_returncode": 1}
+        moved = evidence("stationary", False)
+        moved["after"]["position"]["x"] = 11
+        moved["mineflayer"]["after"]["x"] = 11
+        report = self.call("stationary-moved", movement_mode="stationary", runner=self.runner(life=life, ev=moved, code=1))
+        self.assertFalse(report["negative_control_observed"])
+        broken = evidence("stationary", False)
+        broken["checks"]["transportIntact"] = False
+        report = self.call("stationary-broken", movement_mode="stationary", runner=self.runner(life=life, ev=broken, code=1))
+        self.assertFalse(report["negative_control_observed"])
+
+    def test_bool_codes_and_non_numeric_positions_never_pass(self):
+        for index, patch in enumerate([
+            {"schema_version": True},
+            {"client_returncode": False},
+            {"java_returncode": False},
+        ]):
+            report = self.call(
+                f"bool-life-{index}",
+                runner=self.runner(life={**LIFE, **patch}),
+            )
+            self.assertEqual(report["status"], "failed")
+        for index, bad_value in enumerate([True, "1"]):
+            malformed = evidence()
+            malformed["before"]["position"]["x"] = bad_value
+            report = self.call(
+                f"bad-position-{index}", runner=self.runner(ev=malformed)
+            )
+            self.assertEqual(report["status"], "failed")
+        malformed = evidence()
+        malformed["schemaVersion"] = True
+        self.assertEqual(
+            self.call("bool-schema", runner=self.runner(ev=malformed))["status"],
+            "failed",
+        )
+
+    def test_missing_or_wrong_minecraft_version_never_passes(self):
+        for index, version in enumerate([None, "1.21.5", 1214]):
+            malformed = evidence()
+            if version is None:
+                del malformed["minecraftVersion"]
+            else:
+                malformed["minecraftVersion"] = version
+            report = self.call(
+                f"bad-version-{index}", runner=self.runner(ev=malformed)
+            )
+            self.assertEqual(report["status"], "failed")
+
+    def test_missing_or_false_handshake_barriers_never_pass(self):
+        mutations = [
+            ("handshakeSent", None),
+            ("handshakeSent", False),
+            ("initialPositionsAgree", None),
+            ("initialPositionsAgree", False),
+            ("terminalSettled", None),
+            ("terminalSettled", False),
+        ]
+        for index, (field, value) in enumerate(mutations):
+            malformed = evidence()
+            container = malformed if field == "handshakeSent" else malformed["checks"]
+            if value is None:
+                del container[field]
+            else:
+                container[field] = value
+            report = self.call(
+                f"bad-barrier-{index}", runner=self.runner(ev=malformed)
+            )
+            self.assertEqual(report["status"], "failed")
+
+    def test_runner_exception_still_writes_failed_summary(self):
+        report = self.call('raised', runner=lambda *a, **k: (_ for _ in ()).throw(RuntimeError('secret')))
+        self.assertEqual(report['status'], 'failed')
+        self.assertEqual(report['error'], 'qualification launch failed')
+        self.assertTrue((self.root / 'raised/qualification-summary.json').is_file())
+
+    def test_path_and_inputs_fail_closed(self):
+        with self.assertRaises(QualificationError):
+            run_qualification(workspace=Path('relative'), restore_kwargs={}, tool_snapshot=self.tools, tool_manifest_sha256='c' * 64)
+        with self.assertRaises(QualificationError):
+            self.call('badmode', movement_mode='sideways')
+        existing = self.root / 'existing'
+        existing.mkdir()
+        with self.assertRaises(QualificationError):
+            run_qualification(workspace=existing, restore_kwargs={}, tool_snapshot=self.tools, tool_manifest_sha256='c' * 64)
+
+    def test_malformed_or_symlink_evidence_never_completes(self):
+        report = self.call('malformed', runner=self.runner(ev={'status': 'passed'}))
+        self.assertEqual(report['status'], 'failed')
+        expected = hashlib.sha256(json.dumps({'status': 'passed'}).encode()).hexdigest()
+        self.assertEqual(report['evidence_sha256'], expected)
+        self.assertFalse(report['evidence_valid_for_requested_mode'])
+        self.assertTrue(report['namespace_lifecycle_valid_for_requested_mode'])
+
+        def symlink_runner(argv, **kw):
+            target = kw['cwd'] / 'elsewhere.json'
+            target.write_text(json.dumps(evidence()))
+            os.chmod(target, 384)
+            (kw['cwd'] / 'qualification-evidence.json').symlink_to(target)
+            life = kw['cwd'] / 'namespace-result.json'
+            life.write_text(json.dumps(LIFE))
+            os.chmod(life, 384)
+            return self.result()
+        report = self.call('symlink-evidence', runner=symlink_runner)
+        self.assertEqual(report['status'], 'failed')
+        self.assertIsNone(report['evidence_sha256'])
+        self.assertFalse(report['evidence_valid_for_requested_mode'])
+
+        def public_evidence_runner(argv, **kw):
+            path = kw['cwd'] / 'qualification-evidence.json'
+            path.write_text(json.dumps(evidence()))
+            os.chmod(path, 0o644)
+            life = kw['cwd'] / 'namespace-result.json'
+            life.write_text(json.dumps(LIFE))
+            os.chmod(life, 0o600)
+            return self.result()
+        report = self.call('public-evidence', runner=public_evidence_runner)
+        self.assertEqual(report['status'], 'failed')
+        self.assertIsNone(report['evidence_sha256'])
+        self.assertFalse(report['evidence_valid_for_requested_mode'])
+
+    def test_malformed_json_numbers_and_structure_preserve_failed_summary(self):
+        valid = json.dumps(evidence())
+        malformed_cases = [
+            valid.replace('"x": 0', '"x": ' + ('9' * 4000), 1).encode(),
+            valid.replace('"x": 0', '"x": ' + ('9' * 5000), 1).encode(),
+            ('[' * 1100 + '0' + ']' * 1100).encode(),
+        ]
+        for index, raw in enumerate(malformed_cases):
+            name = f"malformed-json-{index}"
+            report = self.call(name, runner=self.raw_runner(raw))
+            self.assertEqual(report["status"], "failed")
+            self.assertEqual(report["evidence_sha256"], hashlib.sha256(raw).hexdigest())
+            self.assertFalse(report["evidence_valid_for_requested_mode"])
+            self.assertTrue(report["namespace_lifecycle_valid_for_requested_mode"])
+            self.assertEqual(
+                (self.root / name / "runtime/qualification-evidence.json").read_bytes(),
+                raw,
+            )
+            self.assertTrue((self.root / name / "qualification-summary.json").is_file())
+
+    def test_duplicate_keys_and_nonfinite_constants_fail_closed(self):
+        valid = json.dumps(evidence())
+        malformed_cases = [
+            valid.replace('"status": "passed"', '"status": "failed", "status": "passed"', 1).encode(),
+            valid.replace('"health": 20', '"health": NaN', 1).encode(),
+            valid.replace('"health": 20', '"health": Infinity', 1).encode(),
+        ]
+        for index, raw in enumerate(malformed_cases):
+            name = f"ambiguous-json-{index}"
+            report = self.call(name, runner=self.raw_runner(raw))
+            self.assertEqual(report["status"], "failed")
+            self.assertEqual(report["evidence_sha256"], hashlib.sha256(raw).hexdigest())
+            self.assertFalse(report["evidence_valid_for_requested_mode"])
+            self.assertEqual(
+                (self.root / name / "runtime/qualification-evidence.json").read_bytes(),
+                raw,
+            )
+            self.assertTrue((self.root / name / "qualification-summary.json").is_file())
+
+    def test_wrong_dimension_type_and_huge_coordinate_fail_without_losing_summary(self):
+        malformed = evidence()
+        malformed["before"]["dimension"] = ["minecraft:overworld"]
+        report = self.call("bad-dimension-type", runner=self.runner(ev=malformed))
+        self.assertEqual(report["status"], "failed")
+        self.assertTrue((self.root / "bad-dimension-type/qualification-summary.json").is_file())
+
+        malformed = evidence()
+        malformed["before"]["position"]["x"] = 10 ** 4000
+        report = self.call("huge-coordinate", runner=self.runner(ev=malformed))
+        self.assertEqual(report["status"], "failed")
+        self.assertTrue((self.root / "huge-coordinate/qualification-summary.json").is_file())
+
+    def test_initial_agreement_and_both_health_values_are_recomputed(self):
+        malformed = evidence()
+        malformed["mineflayer"]["before"]["x"] = 100
+        self.assertEqual(
+            self.call("false-initial-agreement", runner=self.runner(ev=malformed))["status"],
+            "failed",
+        )
+        for index, (section, health) in enumerate([
+            ("before", 0),
+            ("before", True),
+            ("after", -1),
+            ("after", float("inf")),
+        ]):
+            malformed = evidence()
+            malformed[section]["health"] = health
+            self.assertEqual(
+                self.call(f"bad-health-{index}", runner=self.runner(ev=malformed))["status"],
+                "failed",
+            )
+    def test_symlinked_workspace_parent_is_rejected(self):
+        real = self.root / 'real'
+        real.mkdir()
+        link = self.root / 'link'
+        link.symlink_to(real, target_is_directory=True)
+        with self.assertRaises(QualificationError):
+            run_qualification(workspace=link / 'child', restore_kwargs={}, tool_snapshot=self.tools, tool_manifest_sha256='c' * 64)
+if __name__ == '__main__':
+    unittest.main()

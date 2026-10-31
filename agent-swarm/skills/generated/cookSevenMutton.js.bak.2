@@ -1,0 +1,47 @@
+async function cookSevenMutton(bot) {
+  const mcData = require('minecraft-data')(bot.version);
+  const { goals } = require('mineflayer-pathfinder');
+
+  const furnaceItem = bot.inventory.items().find(i => i.name === "furnace");
+  if (!furnaceItem) {
+    await craftFurnace(bot);
+  }
+
+  const coal = bot.inventory.items().find(i => i.name === "coal");
+  if (!coal) throw new Error("No coal in inventory to fuel furnace");
+
+  const mutton = bot.inventory.items().find(i => i.name === "mutton");
+  if (!mutton) throw new Error("No raw mutton in inventory");
+
+  let furnaceBlock = bot.findBlock({
+    matching: mcData.blocksByName.furnace.id,
+    maxDistance: 64
+  });
+
+  if (!furnaceBlock) {
+    const furnacePosition = await findSuitablePosition(bot);
+    if (!furnacePosition) {
+      throw new Error("Could not find a suitable position for the furnace");
+    }
+    await placeItem(bot, "furnace", furnacePosition);
+    furnaceBlock = bot.findBlock({
+      matching: mcData.blocksByName.furnace.id,
+      maxDistance: 64
+    });
+  }
+
+  if (!furnaceBlock) {
+    throw new Error("Cannot find furnace nearby");
+  }
+
+  await bot.pathfinder.goto(new goals.GoalNear(furnaceBlock.position.x, furnaceBlock.position.y, furnaceBlock.position.z, 2));
+
+  const furnace = await bot.openFurnace(furnaceBlock);
+
+  await furnace.putFuel(bot.inventory.items().find(i => i.name === "coal"));
+  await furnace.putInput(bot.inventory.items().find(i => i.name === "mutton"));
+  await furnace.collectOutput();
+
+  furnace.close();
+  bot.chat("7 mutton cooked.");
+}

@@ -1,0 +1,81 @@
+import io, os, tempfile, unittest, zipfile
+from unittest import mock
+from pathlib import Path
+from tools.pilot.bootstrap import BootstrapError, MAX_CENTRAL_DIRECTORY_BYTES, _BoundedReader, inspect_bootstrap
+
+class Tests(unittest.TestCase):
+ def setUp(self): self.t=tempfile.TemporaryDirectory(); self.r=Path(self.t.name)
+ def tearDown(self): self.t.cleanup()
+ def jar(self, es):
+  p=self.r/'x.jar'
+  with zipfile.ZipFile(p,'w') as z:
+   for n,d in es: z.writestr(n,d)
+  return p
+ def line(self): return 'a'*64+'\thttps://piston-data.mojang.com/v1/objects/abc/server.jar\tmojang_1.21.4.jar'
+ def test_valid(self): self.assertEqual(inspect_bootstrap(self.jar([('META-INF/download-context',self.line())])),{'path':'cache/mojang_1.21.4.jar','sha256':'a'*64})
+ def test_absent(self): self.assertIsNone(inspect_bootstrap(self.jar([('x','')])))
+ def test_invalid_archive_and_symlink(self):
+  p=self.r/'bad';p.write_bytes(b'x')
+  with self.assertRaises(BootstrapError):inspect_bootstrap(p)
+  q=self.r/'link';q.symlink_to(p)
+  with self.assertRaises(BootstrapError):inspect_bootstrap(q)
+ def test_duplicate_and_oversize(self):
+  with self.assertWarns(UserWarning): p=self.jar([('META-INF/download-context',self.line())]*2)
+  with self.assertRaises(BootstrapError):inspect_bootstrap(p)
+  with self.assertRaises(BootstrapError):inspect_bootstrap(self.jar([('META-INF/download-context',b'x'*4097)]))
+ def test_bad_fields(self):
+  bad=[self.line()+'\tx',self.line().replace('a'*64,'A'*64),self.line().replace('https://','http://'),self.line().replace('piston-data.mojang.com','example.com'),self.line().replace('/server.jar','/server.jar?q=1'),self.line().replace('mojang_1.21.4.jar','../x.jar'),self.line().replace('mojang_1.21.4.jar','mojang_1.jar')]
+  for x in bad:
+   with self.assertRaises(BootstrapError):inspect_bootstrap(self.jar([('META-INF/download-context',x)]))
+ def test_rejects_archive_mutated_during_inspection(self):
+  path = self.jar([("META-INF/download-context", self.line())])
+  original = zipfile.ZipFile.infolist
+  def mutate(archive):
+   entries = original(archive)
+   with path.open("ab") as target: target.write(b"x")
+   return entries
+  with mock.patch.object(zipfile.ZipFile, "infolist", mutate):
+   with self.assertRaisesRegex(BootstrapError, "changed during inspection"):
+    inspect_bootstrap(path)
+ def test_rejects_excessive_compressed_metadata(self):
+  path = self.jar([("META-INF/download-context", self.line())])
+  original = zipfile.ZipFile.infolist
+  def enlarge(archive):
+   entries = original(archive)
+   next(x for x in entries if x.filename == "META-INF/download-context").compress_size = 65537
+   return entries
+  with mock.patch.object(zipfile.ZipFile, "infolist", enlarge):
+   with self.assertRaisesRegex(BootstrapError, "exceeds limit"):
+    inspect_bootstrap(path)
+ def test_entry_limit(self):
+  p=self.jar([(str(i),'') for i in range(10001)])
+  with self.assertRaises(BootstrapError):inspect_bootstrap(p)
+ def test_bounded_reader_caps_reads_and_snapshot_seek(self):
+  reader = _BoundedReader(io.BytesIO(b'x' * (MAX_CENTRAL_DIRECTORY_BYTES + 1)), MAX_CENTRAL_DIRECTORY_BYTES + 1)
+  with self.assertRaises(BootstrapError): reader.read()
+  with self.assertRaises(BootstrapError): reader.seek(MAX_CENTRAL_DIRECTORY_BYTES + 2)
+ def test_malformed_port_is_normalized(self):
+  line = self.line().replace('piston-data.mojang.com', 'piston-data.mojang.com:bad')
+  with self.assertRaises(BootstrapError): inspect_bootstrap(self.jar([('META-INF/download-context', line)]))
+ def test_reader_construction_failures_close_descriptors(self):
+  from tools.pilot import bootstrap
+  path = self.jar([('META-INF/download-context', self.line())])
+  real_open, real_dup = bootstrap._open_regular, os.dup
+  for stage in ('dup', 'fdopen'):
+   captured = []
+   def capture_open(*args):
+    fd, info = real_open(*args); captured.append(fd); return fd, info
+   def capture_dup(fd):
+    copy = real_dup(fd); captured.append(copy); return copy
+   try:
+    with mock.patch.object(bootstrap, '_open_regular', side_effect=capture_open):
+     with mock.patch.object(os, 'dup', side_effect=OSError('synthetic') if stage == 'dup' else capture_dup):
+      with mock.patch.object(os, 'fdopen', side_effect=OSError('synthetic')):
+       with self.assertRaises(BootstrapError): inspect_bootstrap(path)
+    for fd in captured:
+     with self.assertRaises(OSError): os.fstat(fd)
+   finally:
+    for fd in captured:
+     try: os.close(fd)
+     except OSError: pass
+if __name__=='__main__':unittest.main()

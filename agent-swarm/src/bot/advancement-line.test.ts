@@ -1,0 +1,100 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+
+import { advancementLine, resetClaims } from "./advancement-line.js";
+import { ALL_ADVANCEMENTS } from "./advancement-tree.js";
+
+// THE BUG THIS FILE EXISTS FOR.
+//
+// getTechTreeLine's terminal branch returned "TECH TREE: complete through
+// diamonds. You are endgame — focus on your role and the mission." Atlas earned
+// story/mine_diamond, so that string was the swarm's stated purpose while it
+// held 13 of 122 advancements and had never entered the nether.
+
+const TEAM_2026_08_13 = new Set([
+  "story/root",
+  "story/mine_stone",
+  "story/upgrade_tools",
+  "story/smelt_iron",
+  "story/iron_tools",
+  "story/obtain_armor",
+  "story/mine_diamond",
+  "story/deflect_arrow",
+  "adventure/root",
+  "adventure/kill_a_mob",
+  "adventure/sleep_in_bed",
+  "husbandry/root",
+  "husbandry/plant_seed",
+]);
+
+test("the line names a concrete next advancement", () => {
+  const line = advancementLine("Miner / Smelter", TEAM_2026_08_13);
+  assert.match(line, /Hot Stuff|lava_bucket/i, `expected the lava bucket step: ${line}`);
+});
+
+test("the line carries the description so the model knows what to DO", () => {
+  const line = advancementLine("Miner / Smelter", TEAM_2026_08_13);
+  assert.match(line, /Fill a Bucket with lava/i);
+});
+
+test("the line reports honest progress out of 122", () => {
+  assert.match(advancementLine("Builder", TEAM_2026_08_13), /13\/122/);
+});
+
+test("no bot is ever told it is finished while advancements remain", () => {
+  for (const role of ["Explorer / Miner", "Farmer / Crafter", "Miner / Smelter", "Builder", "Combat / Guard"]) {
+    const line = advancementLine(role, TEAM_2026_08_13);
+    assert.ok(line.length > 0, `${role} got an empty line`);
+    assert.doesNotMatch(line, /endgame/i, `${role} was told it is endgame at 13/122`);
+  }
+});
+
+test("a completed game yields an empty line rather than a fake goal", () => {
+  const all = new Set(ALL_ADVANCEMENTS.map((a) => a.id));
+  assert.equal(advancementLine("Builder", all), "");
+});
+
+test("the line stays short enough for a per-decision context", () => {
+  assert.ok(advancementLine("Farmer / Crafter", TEAM_2026_08_13).length < 300);
+});
+
+// ── FIVE BOTS MUST GET FIVE GOALS ──
+//
+// Live 2026-08-14: five bots, three distinct advancements. Atlas and Blade were
+// both sent to a Trial Chamber (which they were far too under-geared to
+// survive) and Forge and Mason were both sent for the same lava bucket.
+
+test("all five roles converge on a dominant gateway", () => {
+  // The 2026-08-13 frontier is dominated by the portal chain (lava_bucket, 38
+  // unlocks with the nether wing credited). Parallel trinket-hunting while
+  // the door stays shut is exactly what starved the portal of attention for
+  // three days — convergence here is the intent, not a regression.
+  resetClaims();
+  const roles = ["Explorer / Miner", "Farmer / Crafter", "Miner / Smelter", "Builder", "Combat / Guard"];
+  const ids = roles.map((r) => /\(([^)]+)\)/.exec(advancementLine(r, TEAM_2026_08_13))?.[1]);
+  assert.equal(new Set(ids).size, 1, `expected convergence on the gateway, got ${JSON.stringify(ids)}`);
+  assert.equal(ids[0], "story/lava_bucket");
+});
+
+test("a role keeps its goal across re-planning instead of thrashing", () => {
+  resetClaims();
+  const first = advancementLine("Miner / Smelter", TEAM_2026_08_13);
+  const second = advancementLine("Miner / Smelter", TEAM_2026_08_13);
+  assert.equal(first, second, "re-rendering must not move a bot off its own goal");
+});
+
+test("nobody is sent to a Trial Chamber at iron tier", () => {
+  resetClaims();
+  for (const role of ["Explorer / Miner", "Combat / Guard", "Builder"]) {
+    assert.doesNotMatch(
+      advancementLine(role, TEAM_2026_08_13),
+      /trials_edition|under_lock_and_key|hero_of_the_village/,
+      `${role} was sent somewhere it cannot survive`,
+    );
+  }
+});
+
+test("Forge still gets the nether spine, which is the whole point", () => {
+  resetClaims();
+  assert.match(advancementLine("Miner / Smelter", TEAM_2026_08_13), /lava_bucket/);
+});

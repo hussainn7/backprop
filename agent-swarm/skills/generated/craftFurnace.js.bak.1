@@ -1,0 +1,5 @@
+async function craftFurnace(bot) {
+  const { goals } = require('mineflayer-pathfinder');
+  const furnaceId = bot.registry.itemsByName.furnace.id;
+
+  const craftingTable = bot.findBlock({ matching: (b) => b.name === 'crafting_table

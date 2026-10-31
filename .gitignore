@@ -1,0 +1,33 @@
+# --- secrets & credentials (never commit) ---
+config/
+**/forwarding.secret
+**/.env
+!**/.env.example
+server/server.properties
+server/config/paper-global.yml
+tunnel/
+
+# --- player data / personal ---
+server/ops.json
+server/whitelist.json
+server/usercache.json
+server/banned-*.json
+
+# --- heavy / generated / binaries ---
+runtime/
+backups/
+logs/
+**/logs/
+**/node_modules/
+**/cache/
+**/libraries/
+**/versions/
+**/plugins/
+*.jar
+*.tar.zst
+server/world*/
+server/firstboot.log
+agent-swarm/unsloth_compiled_cache/
+.agent-swarm-upstream.git/
+__pycache__/
+**/lang/

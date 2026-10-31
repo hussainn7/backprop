@@ -1,0 +1,94 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { digBudgetMs, arrivedInCell } from "./escape-to-surface.js";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+test("dig budget covers bare-hand deepslate (15s) with margin", () => {
+  // The old fixed 12s timeout aborted every deepslate dig at y<0 — the block
+  // never broke, so the staircase read "all four sides blocked" forever.
+  assert.equal(digBudgetMs(15_000), 19_000);
+  assert.equal(digBudgetMs(22_500), 26_500); // deepslate iron ore
+});
+
+test("dig budget keeps a floor for fast blocks", () => {
+  assert.equal(digBudgetMs(800), 5_000); // dirt
+});
+
+test("dig budget skips blocks that are hopeless by hand", () => {
+  assert.equal(digBudgetMs(250_000), null); // obsidian
+  assert.equal(digBudgetMs(Infinity), null); // bedrock
+});
+
+test("a slow situation (in water) lengthens the wait but does not make rock hopeless", () => {
+  // deepslate is 15s on dry ground and 75s submerged: still diggable, capped wait
+  assert.equal(digBudgetMs(15_000, 75_000), 79_000);
+  assert.equal(digBudgetMs(22_500, 112_500), 90_000);
+});
+
+import { isBuried, BURIED_CEILING_SCAN } from "./escape-to-surface.js";
+
+const column = (solidAt: Set<number>) => (_x: number, y: number, _z: number) =>
+  solidAt.has(y) ? { boundingBox: "block" } : { boundingBox: "empty" };
+
+test("a tall pocket with rock far overhead still counts as buried", () => {
+  // Flora at y=-45: air at +2..+4, deepslate higher up. The old check looked
+  // only at +2 and read this as open sky, so the escape reflex never fired.
+  assert.equal(isBuried(column(new Set([-45 + 9])), 331, -45, -349), true);
+});
+
+test("the pillar fallback clearing +2..+4 does not un-bury the bot", () => {
+  assert.equal(isBuried(column(new Set([-41 + 5, -41 + 6])), 331, -41, -349), true);
+});
+
+test("open sky above a deep bot is not buried", () => {
+  assert.equal(isBuried(column(new Set()), 0, 20, 0), false);
+});
+
+test("a bot in the surface band is never buried", () => {
+  assert.equal(isBuried(column(new Set([70])), 0, 60, 0), false);
+});
+
+test("rock beyond the scan range does not count", () => {
+  assert.equal(isBuried(column(new Set([10 + BURIED_CEILING_SCAN + 1])), 0, 10, 0), false);
+});
+
+test("walk-out falls back to digging by hand when the walk cannot move", () => {
+  // Run 754: Flora, pickless inside a lake at (345, 41, -346), got
+  // "relocation moved 1 blocks" forty-three times. The pathfinder refuses to
+  // break rock it cannot harvest, so for a pickless bot the walk is never the
+  // way out and the hand tunnel is the whole capability. Guard it by shape:
+  // the fallback must stay below the walk, in the same function.
+  const source = fs.readFileSync(path.join(__dirname, "escape-to-surface.ts"), "utf8");
+  const walkStart = source.indexOf("async function walkOutFromWater");
+  assert.notStrictEqual(walkStart, -1, "the walk-out function must still exist");
+  const walkEnd = source.indexOf("\n}", source.indexOf("hand tunnel advanced", walkStart));
+  const body = source.slice(walkStart, walkEnd);
+  assert.match(body, /safeGoto\(/, "it should still try walking first");
+  assert.match(body, /handTunnel\(/, "it must dig by hand when the walk gains nothing");
+  assert.ok(
+    body.indexOf("safeGoto(") < body.indexOf("handTunnel("),
+    "the hand tunnel is the fallback, so the walk has to come first",
+  );
+});
+
+test("arrived in cell: the centre of the dug block is home", () => {
+  assert.strictEqual(arrivedInCell(344.5, -351.5, 344, -352), true);
+  assert.strictEqual(arrivedInCell(344.6, -351.4, 344, -352), true, "a little off centre still counts");
+});
+
+test("arrived in cell: the next block along is not", () => {
+  // The bug this exists to stop: holding forward for 700ms covers about three
+  // blocks, so the bot walked through the cell it cleared into solid rock and
+  // suffocated. One cell over must read as not arrived.
+  assert.strictEqual(arrivedInCell(345.5, -351.5, 344, -352), false);
+  assert.strictEqual(arrivedInCell(344.5, -353.5, 344, -352), false);
+});
+
+test("arrived in cell: the tolerance can be widened for the final check", () => {
+  assert.strictEqual(arrivedInCell(345.1, -351.5, 344, -352), false);
+  assert.strictEqual(arrivedInCell(345.1, -351.5, 344, -352, 0.8), true);
+});

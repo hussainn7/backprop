@@ -1,0 +1,127 @@
+import type { Skill } from "./types.js";
+import { buildHouseSkill } from "./build-house.js";
+import { craftGearSkill } from "./craft-gear.js";
+import { lightAreaSkill } from "./light-area.js";
+import { buildFarmSkill } from "./build-farm.js";
+import { stripMineSkill } from "./strip-mine.js";
+import { smeltOresSkill } from "./smelt-ores.js";
+import { goFishingSkill } from "./go-fishing.js";
+import { buildBridgeSkill } from "./build-bridge.js";
+import { setupStashSkill } from "./setup-stash.js";
+import { craftBucketSkill } from "./craft-bucket.js";
+import { fillBucketSkill } from "./fill-bucket.js";
+import { setupEnchantingSkill } from "./setup-enchanting.js";
+import { brewPotionSkill } from "./brew-potion.js";
+import { glowSignSkill } from "./glow-sign.js";
+import { woodRunSkill } from "./wood-run.js";
+import { breedAnimalsSkill } from "./breed-animals.js";
+import { bucketFishSkill } from "./bucket-fish.js";
+import { huntLeatherSkill } from "./hunt-leather.js";
+import { huntFoodSkill } from "./hunt-food.js";
+import { waxOffSkill } from "./wax-off.js";
+import { harvestHoneySkill } from "./harvest-honey.js";
+import { tameAnimalSkill } from "./tame-animal.js";
+import { huntStringSkill } from "./hunt-string.js";
+import { shootArrowSkill } from "./shoot-arrow.js";
+import { ohShinySkill } from "./oh-shiny.js";
+import { findFortressSkill } from "./find-fortress.js";
+import { craftFlintAndSteelSkill } from "./flint-and-steel.js";
+import { buildNetherPortalSkill, returnFromNetherSkill } from "./nether-portal.js";
+import { tradeWithVillagerSkill } from "./trade-with-villager.js";
+import { lootBastionSkill } from "./loot-bastion.js";
+import { mineFrontierSkill } from "./mine-frontier.js";
+import { waxCopperSkill } from "./wax-copper.js";
+import { escapeToSurfaceSkill } from "./escape-to-surface.js";
+
+export const skillRegistry = new Map<string, Skill>();
+const generatedSkillNames = new Set<string>();
+
+function register(skill: Skill) {
+  skillRegistry.set(skill.name, skill);
+}
+
+register(buildHouseSkill);
+register(craftGearSkill);
+register(lightAreaSkill);
+register(buildFarmSkill);
+register(stripMineSkill);
+register(smeltOresSkill);
+register(goFishingSkill);
+register(buildBridgeSkill);
+register(setupStashSkill);
+register(craftBucketSkill);
+register(fillBucketSkill);
+register(setupEnchantingSkill);
+register(brewPotionSkill);
+register(glowSignSkill);
+register(woodRunSkill);
+register(breedAnimalsSkill);
+register(bucketFishSkill);
+register(huntLeatherSkill);
+register(huntFoodSkill);
+register(waxOffSkill);
+register(harvestHoneySkill);
+register(tameAnimalSkill);
+register(huntStringSkill);
+register(shootArrowSkill);
+register(ohShinySkill);
+register(findFortressSkill);
+register(craftFlintAndSteelSkill);
+register(buildNetherPortalSkill);
+register(returnFromNetherSkill);
+register(tradeWithVillagerSkill);
+register(lootBastionSkill);
+register(mineFrontierSkill);
+register(waxCopperSkill);
+register(escapeToSurfaceSkill);
+
+const builtInSkillNames = new Set(skillRegistry.keys());
+
+/** Every TypeScript skill explicitly registered by this source tree. */
+export function getBuiltInSkillNames(): Set<string> {
+  return new Set(builtInSkillNames);
+}
+
+export function registerGeneratedSkill(skill: Skill): void {
+  if (skillRegistry.has(skill.name) && !generatedSkillNames.has(skill.name)) {
+    throw new Error(`Generated skill '${skill.name}' collides with a trusted skill`);
+  }
+  skillRegistry.set(skill.name, skill);
+  generatedSkillNames.add(skill.name);
+}
+
+export function clearGeneratedSkills(): void {
+  for (const name of generatedSkillNames) skillRegistry.delete(name);
+  generatedSkillNames.clear();
+}
+
+export function getGeneratedSkillNames(): string[] {
+  return Array.from(generatedSkillNames);
+}
+
+export function registerTrustedHotReloadSkill(skill: Skill): void {
+  if (generatedSkillNames.has(skill.name)) {
+    throw new Error(`Trusted skill '${skill.name}' collides with an approved generated skill`);
+  }
+  skillRegistry.set(skill.name, skill);
+}
+
+// Dynamic skills are loaded lazily by calling loadDynamicSkills() from dynamic-loader.ts.
+// The import is intentionally kept out of this file to avoid circular module evaluation:
+// dynamic-loader.ts imports skillRegistry from this file, so registry.ts must not
+// import dynamic-loader.ts at module load time (TDZ / circular ref issue with tsx/Node ESM).
+
+/** Generate the SKILLS section for the LLM system prompt. */
+export function getSkillPromptLines(): string {
+  const lines: string[] = [];
+  for (const skill of skillRegistry.values()) {
+    const paramStr =
+      Object.keys(skill.params).length > 0
+        ? `params: { ${Object.entries(skill.params)
+            .map(([k, v]) => `"${k}": ${v.type}`)
+            .join(", ")} }`
+        : "params: {}";
+    lines.push(`- ${skill.name}: [SKILL] ${skill.description} ${paramStr}`);
+  }
+  return lines.join("\n");
+}

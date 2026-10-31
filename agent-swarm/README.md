@@ -1,0 +1,671 @@
+# Minecraft Agent Swarm
+
+A swarm of local-LLM agents that play Minecraft together, with persistent memory, shared coordination, and a hybrid skill system: hand-crafted TypeScript skills, Voyager-style JavaScript skills, and dynamic skill generation.
+
+Each of the 5 bots specializes in a different area — exploring, farming, mining, building, or combat — and they coordinate through shared context and a central resource stash.
+
+**The bots earn everything in-game.** No item handouts, no teleport rescues, no scripted shortcuts that act on their behalf — progress comes from making the *agents* more capable (better prompts, skills, and action logic), not from cheating for them. Self-improvement is the whole point.
+
+Designed for live streaming: includes a Mission Control dashboard, per-bot 3D viewers, OBS overlays, TTS, and Twitch integration.
+
+> Formerly `mineflayer-chatgpt`. Renamed to reflect what it became: a multi-agent swarm running on local models, not a single ChatGPT bot.
+
+🏆 **The Advancement Ledger — every achievement the swarm has earned for itself, live:** [jesseweigel.com/minecraft-advancements](https://jesseweigel.com/minecraft-advancements)
+This is the project's main scoreboard and the clearest proof of progress: each of the 122 vanilla advancements, marked as the bots genuinely earn them.
+
+📖 **Project page, devlogs, and live scoreboard stats:** [jesseweigel.com/workshop/minecraft-agent-swarm](https://jesseweigel.com/workshop/minecraft-agent-swarm)
+
+## Experimental evaluation
+
+Alongside the live swarm, we are building a reproducible evaluation track using
+preserved world copies, action/observation provenance, and server-checked outcomes.
+It runs separately from normal gameplay. We have measured a client/server movement
+disagreement and retained both successful and failed qualification attempts; we
+have not demonstrated model learning, cost savings, or robotics transfer.
+
+See the [research status and evidence](docs/research/README.md),
+[first benchmark release checklist](docs/research/benchmark-release-checklist.md),
+and [study protocol](docs/pilot-study-protocol.md). Jev-inspired decision models
+are an [optional comparison under investigation](docs/research/typed-decision-models.md),
+not a requirement for running the swarm.
+
+The experimental track now includes a [fresh-world generation recipe](docs/research/fresh-fixture.md)
+that passed forward and stationary controls without the private swarm world.
+The [clean-checkout reproduction](docs/research/clean-checkout-reproduction.md)
+also passes with fresh dependencies on the same WSL host. This qualifies test
+infrastructure; it is not a model-performance result. A fixed survival client
+now also [mines and collects one oak log](docs/research/oak-game-qualification.md),
+with a server-verified outcome. [Four same-source controls](docs/research/oak-negative-controls.md)
+distinguish collection from breaking without collection, approaching a bedrock-enclosed
+target, and doing nothing. [Fault-injection checks](docs/research/oak-fault-qualification.md)
+also reject injected progress and missing terminal observations, including a forged
+endpoint that otherwise looks successful. A [disconnect during the action window](docs/research/oak-interruption-qualification.md)
+is now rejected without a score; a separate intermittent bridge-shutdown failure
+is preserved and unresolved. [Relay diagnostics and a strict offline action parser](docs/research/bridge-diagnostics.md)
+are now in place. The [bounded action executor](docs/research/model-action-session.md)
+and its dedicated pipe transport pass offline tests for ordering, deadlines,
+cancellation and subprocess round trips. Participant lifecycle gates and dedicated
+action pipes also pass production namespace isolation checks. A
+[seven-request scripted replay](docs/research/scripted-oak-qualification.md) now mines
+and collects an oak log through that interface in 4.047 seconds, with independent
+server verification and a stationary control using identical sources and inputs.
+These are scripted infrastructure checks; no model benchmark or learning result is claimed.
+
+The research harness also [rejects a deadline-limited scripted dig](docs/research/scripted-deadline-qualification.md), preserving its partial transcript and passing fresh collection/stationary controls. These are scripted infrastructure checks, not model-learning results.
+
+A [socket-shutdown correction](docs/research/socket-close-qualification.md) now waits for clean network closure; real TCP regressions and a collection trial pass. The initial stationary attempt stopped at storage setup; a same-source retry now passes, with the failed attempt retained. The [first model pilot](docs/research/first-model-pilot-protocol.md) remains a protocol draft.
+
+The [bounded local model adapter](docs/research/ollama-adapter.md) now passes
+fake-server tests for timeouts, cancellation and token accounting. Connecting it
+to the protected game coordinator and qualifying a pinned model remain ahead.
+
+---
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│              Event-Driven Brain (per bot, src/bot/brain.ts)   │
+│  events: idle(10s)→strategic · hostiles/damage→reactive ·     │
+│  action done→critic · chat→reply                              │
+│  World Context + Team Bulletin + TECH TREE → LLM → Action     │
+│            (single Ollama MoE: gpt-oss:20b)                   │
+└────────────────────────┬─────────────────────────────────────┘
+                         │
+          ┌──────────────┼──────────────┐
+          ▼              ▼              ▼
+   TypeScript Skills  Voyager Skills  Neural Combat
+   (build_house,      (57 JS skills   (Python TCP server
+    craft_gear,        in vm sandbox)  heuristic policy)
+    strip_mine, …)
+          │              │              │
+          └──────────────┴──────────────┘
+                         │
+          ┌──────────────▼──────────────┐
+          │     Per-Bot Memory (.json)  │
+          │  (structures, deaths, ores, │
+          │   skill success rates)      │
+          └──────────────┬──────────────┘
+                         │
+          ┌──────────────▼──────────────┐
+          │     Team Bulletin (shared)  │
+          │  (each bot's action, pos,   │
+          │   thought — injected into   │
+          │   every LLM prompt)         │
+          └─────────────────────────────┘
+```
+
+### Bot Team
+
+| Bot | Role | Specialty | Leash Radius |
+|-----|------|-----------|-------------|
+| **Atlas** | Scout / Explorer | Roams far, discovers ores/biomes, maps terrain | 500 blocks |
+| **Flora** | Farmer / Crafter | Grows crops, breeds animals, processes materials | 100 blocks |
+| **Forge** | Miner / Smelter | Strip mines, digs tunnels, smelts ores | 250 blocks |
+| **Mason** | Builder | Builds houses, bridges, lights areas, manages stash | 150 blocks |
+| **Blade** | Combat / Guard | Patrols perimeter, kills hostiles, hunts animals | 300 blocks |
+
+Each bot has its own personality, allowed actions, allowed skills, memory file, and leash radius. They share a central stash of chests for resource exchange and see each other's status via the Team Bulletin.
+
+### Key Components
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| Brain (decision engine) | `src/bot/brain.ts` | Event-driven: strategic/reactive/critic/chat handlers |
+| Bot lifecycle | `src/bot/index.ts` | Connection, spawn safety, plugin loading |
+| Scoreboard | `src/bot/scoreboard.ts` | Per-session metrics + tech milestones → `logs/sessions/` |
+| Curriculum | `src/bot/curriculum.ts` | Inventory-driven tech-tree next-goal injection |
+| Skill reliability | `src/skills/reliability.ts` | Team-wide success rates; auto-retires broken skills |
+| Trajectory capture | `src/bot/trajectory.ts` | Logs prompt→decision→outcome for fine-tuning |
+| Navigation helpers | `src/bot/navigation.ts` | safeGoto, drop collection, movement presets |
+| Role configs | `src/bot/role.ts` | Per-bot personality, actions, skills, leash |
+| Team bulletin | `src/bot/bulletin.ts` | Shared status between bots |
+| World perception | `src/bot/perception.ts` | Builds context string for LLM |
+| Action executor | `src/bot/actions.ts` | Routes JSON actions to implementations |
+| LLM client | `src/llm/index.ts` | Ollama API with retry + JSON repair |
+| Skill executor | `src/skills/executor.ts` | Runs skills with abort support |
+| Voyager loader | `src/skills/dynamic-loader.ts` | Runs JS skills in vm sandbox |
+| Skill generator | `src/skills/generator.ts` | LLM generates new JS skills |
+| Memory | `src/bot/memory.ts` | Per-bot persistent JSON |
+| Stash actions | `src/skills/stash.ts` | Deposit/withdraw from shared chests |
+| Neural combat | `src/neural/combat.ts` | 50ms tick loop using TCP server |
+| Neural server | `neural_server.py` | Python heuristic/VPT policy server |
+| Dashboard | `src/stream/dashboard.ts` | Mission Control on port 3010 |
+| Stream viewer | `src/stream/viewer.ts` | Per-bot prismarine-viewer |
+| OBS overlay | `src/stream/overlay.ts` | Per-bot WebSocket overlay for OBS |
+| TTS | `src/stream/tts.ts` | Text-to-speech for bot thoughts |
+| Safety filter | `src/safety/filter.ts` | Blocks harmful chat/thoughts |
+
+### In-game commands
+
+Set `BOT_COMMAND_WHITELIST` to a comma-separated list of Minecraft usernames
+that may control the bots. An empty value disables commands. Authorized players
+can use `!status`, `!come`, `!stay`, `!resume`, `!goal set <text>`, `!goal show`,
+`!goal clear`, and `!inventory`. Command arguments pass through the same safety
+filter as viewer messages, and other players' command-shaped messages are ignored.
+
+---
+
+## Setup
+
+### Requirements
+
+- Node.js 20+
+- [Ollama](https://ollama.ai) with `gpt-oss:20b` pulled (one MoE model serves all decision types — chosen by A/B trial over qwen3.6 and nemotron-3-nano for structured-output quality and speed)
+- Minecraft Java Edition server (1.21.4) with 5+ player slots
+- Python 3.10+ (for neural combat server)
+
+### Install
+
+```bash
+git clone https://github.com/JesseRWeigel/minecraft-agent-swarm.git
+cd minecraft-agent-swarm
+npm install
+pip install -r requirements.txt   # for neural server
+```
+
+### Configure
+
+Create a `.env` file:
+
+```env
+# Minecraft server
+MC_HOST=localhost
+MC_PORT=25565
+MC_USERNAME=Atlas
+MC_USERNAME_2=Flora
+MC_USERNAME_3=Forge
+MC_USERNAME_4=Mason
+MC_USERNAME_5=Blade
+MC_VERSION=1.21.4
+MC_AUTH=offline
+
+# LLM backend — "ollama" (default, local) or "openai" (any OpenAI-compatible API)
+LLM_PROVIDER=ollama
+OLLAMA_HOST=http://localhost:11434
+OLLAMA_MODEL=gpt-oss:20b       # MoE: ~3.6B active params, ~200 tok/s on a 32GB GPU
+OLLAMA_FAST_MODEL=gpt-oss:20b  # Same model — avoids VRAM eviction thrash between two residents
+# Reasoning-native models (gpt-oss) run with think:"low"; qwen needs think:false (auto-detected in src/llm)
+
+# Bot identity
+BOT_NAME=Atlas
+BOT_IDLE_INTERVAL_MS=10000   # How often the brain re-plans when nothing is happening
+BOT_CHAT_COOLDOWN_MS=3000
+
+# Multi-bot mode
+ENABLE_MULTI_BOT=true
+BOT_COUNT=5                   # 1=Atlas only, 2=+Flora, 5=all bots
+
+# Autonomy
+ALLOW_INTERVENTIONS=false     # false (default): LLM decides everything, no cheating.
+                              # true: re-enable deterministic scaffolding (demos only)
+
+# Twitch (optional)
+TWITCH_CHANNEL=your_channel
+TWITCH_BOT_USERNAME=your_bot
+TWITCH_OAUTH_TOKEN=oauth:...
+```
+
+### Using OpenAI (or any OpenAI-compatible API)
+
+The swarm runs on local Ollama by default. To use a hosted API instead, set
+`LLM_PROVIDER=openai` and supply a base URL and key:
+
+```bash
+LLM_PROVIDER=openai
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_API_KEY=sk-your-key-here
+OPENAI_MODEL=gpt-5.6-terra      # strategic decisions
+OPENAI_FAST_MODEL=gpt-5.6-luna  # reactive decisions + critic (defaults to OPENAI_MODEL)
+```
+
+Nothing else changes — `npm start` as usual. On boot the banner reports which
+backend is live:
+
+```
+LLM: gpt-5.6-terra @ https://api.openai.com/v1 [openai]
+```
+
+**`OPENAI_MODEL` has no default and startup fails without it.** Model IDs go
+stale quickly, so rather than bake in a name that will quietly 404 next quarter,
+list what your key can actually reach:
+
+```bash
+curl https://api.openai.com/v1/models -H "Authorization: Bearer $OPENAI_API_KEY"
+```
+
+The IDs above were current in August 2026 (`gpt-5.6` is an alias for
+`gpt-5.6-sol`; `terra` is the balanced tier, `luna` the cheap high-volume one).
+Check the list before copying them.
+
+Any OpenAI-compatible gateway works; only the base URL and model name change:
+
+| Provider | `OPENAI_BASE_URL` |
+|---|---|
+| OpenAI | `https://api.openai.com/v1` |
+| OpenRouter | `https://openrouter.ai/api/v1` |
+| Groq | `https://api.groq.com/openai/v1` |
+| Together | `https://api.together.xyz/v1` |
+| vLLM / LiteLLM / LM Studio | your own host, ending in `/v1` |
+
+Self-hosted gateways still need `OPENAI_API_KEY` set to something non-empty, even
+if they ignore it.
+
+**Two things worth knowing before you switch:**
+
+- **The model must support JSON mode.** Every decision is requested with
+  `response_format: {"type": "json_object"}` and parsed as JSON. A model or
+  gateway that rejects that field will not work.
+- **Don't point `OPENAI_BASE_URL` at a local Ollama's `/v1` to run a qwen3-family
+  model.** The `think` control has no OpenAI equivalent, so the model reasons
+  until it hits the token cap and returns empty content. Measured on this repo:
+  `qwen3.6:35b-a3b` over `/v1` returns `""`, while the same model via
+  `LLM_PROVIDER=ollama` returns valid JSON. For local models, use
+  `LLM_PROVIDER=ollama`.
+
+**Cost.** This workload is chattier than most. Measured on a five-bot swarm:
+roughly **900–1,000 actions per hour**, and each action costs a strategic call
+plus a critic call — so ~2,000 API calls/hour, every hour, indefinitely. Prompts
+carry world state and skill lists, so they are not small.
+
+Three levers, in order of effect:
+
+1. Put the cheap model in `OPENAI_FAST_MODEL` — it serves the reactive and critic
+   paths, about two thirds of all calls.
+2. `BOT_CRITIC_ENABLED=false` removes one call per action outright.
+3. `BOT_COUNT=1` runs Atlas alone instead of five bots.
+
+Run it metered for an hour and check your usage dashboard before leaving it
+unattended overnight.
+
+### Run
+
+```bash
+# Start Minecraft server first, then:
+npm run dev
+```
+
+The bots will:
+1. Connect to the Minecraft server (staggered 10s apart)
+2. Start the neural combat server automatically
+3. Start the unified 3D viewer at `http://localhost:3000` (switch bots with keys 1-5; per-bot ports are a fallback)
+4. Start Mission Control dashboard at `http://localhost:3010`
+5. Begin autonomous decision loops
+
+> **Note:** All bot usernames must be operators on the server (e.g. `/op Atlas`, `/op Flora`, etc.) so they can set gamerules and use teleport-based spawn safety.
+
+> **Tip:** With `online-mode=false` you can join the world yourself — Direct Connect to `localhost:25565` with any username and watch the bots up close (`/gamemode spectator` for free-flight).
+
+### Single-Bot Mode
+
+To run just Atlas (original single-bot behavior):
+
+```env
+ENABLE_MULTI_BOT=false
+```
+
+---
+
+## Features
+
+### Multi-Bot Team Coordination
+
+The 5 bots coordinate through **shared context** — no coordinator bot, no task assignment. Each bot's LLM prompt includes a Team Bulletin showing what every other bot is doing:
+
+```
+TEAM STATUS (live):
+- Atlas: exploring north at (450, 72, -280) — "Found a massive cave system!"
+- Flora: running build_farm at (285, 65, -318) — "Planting wheat row 3"
+- Forge: running strip_mine at (290, 11, -315) — "Mining iron ore vein"
+- Mason: running build_house at (282, 66, -322) — "Placing roof blocks"
+- Blade: patrolling at (300, 68, -310) — "All clear"
+```
+
+This enables natural coordination: Flora sees Forge deposited raw iron and decides to smelt it. Mason sees Atlas found a good building spot and heads there. Blade sees Flora farming at night and patrols near her.
+
+### Shared Stash
+
+All bots share a central stash of categorized chests:
+
+| Row | Category | Example Items |
+|-----|----------|--------------|
+| 1 | Building | logs, planks, cobblestone, glass |
+| 2 | Metals & Ores | raw iron, iron ingots, copper, coal |
+| 3 | Food & Farming | wheat, seeds, bread, cooked meat |
+| 4 | Tools & Combat | swords, pickaxes, armor, arrows |
+| 5+ | Overflow | anything else |
+
+Mason bootstraps the first chest on spawn. When chests fill up, Mason crafts and places more. Bots deposit excess items and withdraw what they need via `deposit_stash` / `withdraw_stash` actions.
+
+### Mission Control Dashboard
+
+Access at `http://localhost:3010` — a single page showing all bots at a glance:
+
+- **Bot cards** at top: real-time health, current action, last thought, position
+- **3D viewer** in center: click any bot to switch the live view
+- **Stash status** sidebar: inventory summary across all stash chests
+- **Auto-cycle** button: toggles automatic switching between bots (30s each)
+- **Keyboard shortcuts**: 1-5 to select a bot, C to toggle auto-cycle
+
+### Port Allocation
+
+All bots share the unified viewer at `:3000`. Per-bot ports below are the legacy fallback when the unified viewer is unavailable:
+
+| Bot | 3D Viewer (fallback) | Overlay |
+|-----|-----------|---------|
+| Atlas | :3000 | :3001 |
+| Flora | :3002 | :3003 |
+| Forge | :3004 | :3005 |
+| Mason | :3006 | :3007 |
+| Blade | :3008 | :3009 |
+| Dashboard | :3010 | — |
+
+### Autonomous Decision Making
+
+The brain is **event-driven**, not a polling loop:
+- **Strategic** (every ~10s idle, or on goal completion): full world context + team bulletin + memory + tech-tree curriculum → goal-setting decision
+- **Reactive** (hostiles spotted, damage taken, low health/hunger): tiny prompt, fast response
+- **Critic** (after every action): verifies the result, suggests the next step or triggers a re-plan
+- **Chat** (player/viewer/teammate message): in-character reply
+
+Each decision executes a gated action (restricted to the bot's allowed actions/skills), records success/failure, and updates memory, the team bulletin, the scoreboard, and the trajectory log.
+
+**Stuck detection:** If the same action fails 2+ times in a row, the bot is forced to choose a different approach. Failed actions are injected into the next prompt.
+
+**Goal persistence:** The LLM can set multi-step goals (e.g., "build a house") with a step count. The bot tracks progress across decision cycles.
+
+**Leash enforcement:** Each bot has a max distance from home. At 80% of leash radius, the LLM is warned. At 150%, the bot is force-navigated home.
+
+**Autonomy — no cheating (default):** With `ALLOW_INTERVENTIONS=false` (the default) the LLM decides *everything*. There are no deterministic overrides that act for the bots or hand them resources. The only non-LLM helpers are reflexes a human player would do without thinking: auto-equipping the best armor a bot already owns, digging itself out when boxed in, and swimming to the surface when its head goes underwater (self-preservation, not item handouts). Setting `ALLOW_INTERVENTIONS=true` re-enables optional scaffolding (leash returns, water/buried escapes, stash bootstrap) for reliability demos — but the project's goal is capability that survives with interventions *off*.
+
+### Skill System
+
+**TypeScript skills** (assigned per role):
+- `build_house` — build a 7x7 shelter with doors, crafting table, torches
+- `build_farm` — hoe dirt, plant wheat near water, harvest when ready
+- `build_bridge` — bridge across water/gaps in facing direction
+- `craft_gear` — craft the best available tool set (tries diamond→iron→stone→wood per tool)
+- `strip_mine` — staircase down to Y=11, then tunnel — scans the surrounding walls and follows any ore vein it exposes
+- `smelt_ores` — smelt raw ore into ingots, crafts a furnace from cobblestone if needed
+- `light_area` — place torches in a radius
+- `go_fishing` — cast and reel a fishing rod
+- `wax_copper` — craft a copper block and shears, walk to the bee nest by waypoints, wait until its honey level reads 5, seat a campfire under it so the bees survive the harvest, shear a honeycomb and wax the block (Wax On)
+- `escape_to_surface` — hand-carve a staircase (or pillar) up to daylight when a bot is buried with no pickaxe; each dig waits the block's real bare-hand break time (deepslate 15s), a brain reflex fires it for any pickless bot with rock overhead, and a death mid-climb is reported as a failure
+- `setup_stash` — bootstrap shared chest area
+- `neural_combat` — 50ms tick reactive combat via Python server
+
+**Voyager JS skills** (57 skills, run in vm sandbox):
+- Crafting: `craftWoodenPickaxe`, `craftIronPickaxe`, `craftCraftingTable`, `craftFurnace`, `craftChest`, `craftBucket`, and more
+- Mining: `mineWoodLog`, `mineFiveCoalOres`, `mineFiveIronOres`, `mineTenCobblestone`, and more
+- Smelting: `smeltFiveRawIron`, `smeltRawCopper`, and more
+- Combat: `killOnePig`, `killOneZombie`, `killFourSheep`, and more
+- Gathering: `collectBamboo`, `collectFiveCactusBlocks`, `fillBucketWithWater`
+
+**Isolated generated skills (disabled by default):** Model-produced JavaScript is quarantined in a content-addressed store. It cannot enter the registry until an operator verifies it in the Bubblewrap sandbox and promotes its exact SHA-256. Approved generated code runs in a separate Linux process with no network, no inherited environment, a read-only minimal filesystem, a seccomp syscall policy, and CPU, memory, file, descriptor, request, and wall-clock limits. It can only request bounded high-level Minecraft capabilities over validated JSON RPC. Authored Voyager files remain on the trusted in-process path and cannot be replaced by generation or refinement.
+
+Enable this subsystem only on Linux x64 after installing `bubblewrap` and running its mandatory qualification:
+
+```bash
+sudo apt-get install bubblewrap
+GENERATED_SKILLS_BWRAP=/usr/bin/bwrap npm run test:sandbox
+```
+
+Then set `GENERATED_SKILLS_ENABLED=true`. Generation creates an inert candidate and prints its ID and SHA; it never installs or reloads the code. Use the operator CLI to review and advance it:
+
+```bash
+npm run generated-skill -- list
+npm run generated-skill -- verify <candidate-id>
+npm run generated-skill -- promote <candidate-id> <exact-sha256>
+npm run generated-skill -- rollback <skill-name>
+```
+
+Verification, promotion, runtime loading, and each execution bind the same candidate hash and current sandbox-policy fingerprint. A policy/runtime change or later failed verification revokes execution. Restart the swarm after promote or rollback so the registry picks up the selected version. Promotion/rollback uses an exclusive fail-closed lock; after a crash, inspect the store and remove a stale `.lock` only while all generated-skill operator commands are stopped.
+
+The containment boundary trusts the host kernel, Node executable, Bubblewrap,
+`prlimit`, seccomp installation, and the local operator. It does not protect
+against the same local account or root modifying the store, runtime, or policy,
+and authored TypeScript/Voyager code remains trusted. The allowed capabilities
+can deliberately change the Minecraft world within their distance and quota
+limits. Candidate verification is a deterministic isolated smoke test of the
+protocol and completion path; it does not prove that a skill is useful or
+correct on a live server, so review the code and exact hash before promotion.
+
+
+### Freeze Protection (Watchdogs)
+
+A bot's brain loop awaits its current skill/action, so a single unbounded `await` on a server response (`pathfinder.goto` to an unreachable spot, `bot.dig` on a bad block state, a furnace GUI that never opens) used to freeze a bot **forever** — online and healthy-looking, but brain-dead. This is now impossible, enforced in layers:
+
+- **Skill watchdog (240s)** — `runSkill` races every skill against a hard timeout that stops the pathfinder, releases any in-progress dig, and returns control to the brain (`src/skills/executor.ts`).
+- **Action watchdog (150s)** — direct actions (`mine_block`, `go_to`, `gather_wood`, ...) get the same treatment at the dispatch boundary (`src/bot/actions.ts`); skills are exempt since they have their own watchdog.
+- **Bounded primitives** — every `pathfinder.goto` (8–30s), `bot.dig` (12s), `bot.craft` (20s), `openFurnace`/`openContainer` (10s) inside skills/actions is wrapped in a timeout race so failures are fast, not 4 minutes.
+- **Aggregate loop budgets** — loops that repeat bounded travel (stash withdrawal item-types, per-tree wood gathering, wheat harvest passes) carry a wall-clock cap, because N bounded calls still sum past a watchdog.
+- **Fail-fast reachability** — `deposit_stash` bails immediately if the bot didn't actually reach the stash instead of retrying every downstream step against the same unreachable spot.
+
+The watchdogs are the backstop; the per-call bounds make skills fail in seconds with a useful error the LLM can re-plan on. Health monitoring compares each bot's last-decision timestamp against the newest log line — a hung brain is visible even though the bot never dies.
+
+### Persistent Memory
+
+Each bot has its own memory file (e.g. `memory-atlas.json`, `memory-forge.json`):
+- **Structures:** Location and type of every house/farm/furnace/mine built
+- **Deaths:** Last 50 deaths with location and cause
+- **Ore discoveries:** Locations of found ore veins
+- **Skill history:** Success rate and average duration for every skill
+- **Season goal:** Long-term mission set via `!goal set <text>` in-game
+- **Broken skills:** Dynamic skills with 5+ failures permanently blocked
+
+### Neural Combat
+
+A Python TCP server (`neural_server.py`) on port 12345 responds to combat observations with: `attack`, `strafe_left`, `strafe_right`, `flee`, `use_item`, or `idle`.
+
+Combat ticks run at 50ms intervals for up to 10 seconds per engagement. If the neural server is unreachable, bots fall back to `mineflayer-pvp`. Blade is the primary combat bot but all bots can flee from threats.
+
+### Live Streaming
+
+- **Mission Control** — All-bot dashboard at `http://localhost:3010`
+- **Per-bot 3D viewers** — prismarine-viewer with follow/first-person/orbit camera modes
+- **OBS overlays** — Per-bot WebSocket overlay showing health, food, position, inventory, thought, action
+- **TTS** — Bot thoughts converted to speech and played through overlay
+  - Generated clips use collision-resistant UUID filenames and are ignored by Git. Legacy generated MP3s are removed from tracking without rewriting history; existing local files remain available to the normal retention policy. In-progress files use exclusive staging names outside cleanup, then publish without overwriting an existing path. Cleanup uses file modification times for UUID and legacy numeric/scientific filenames: published clips have a 10-minute grace period for deferred overlay playback, clips older than 24 hours are removed, and clips outside the grace period are trimmed toward a 10-file target. Each overlay queues at most 10 waiting clips and drops a queued URL after nine minutes, before the file-retention grace period expires. The entire `thought-*.mp3` namespace is retention-managed, so use other names for manually maintained audio. Staging files left by a crashed process are intentionally preserved; inspect and remove stale `.thought-*.mp3.part` files only while TTS writers are stopped.
+- **Twitch integration** — Reads Twitch chat; viewers can interact with the bots
+
+### Survival & Resource Loops
+
+The bots run the real Minecraft progression loops end-to-end, using only their own faculties:
+
+- **Iron chain:** `mine_block`/`strip_mine` vein-mine ore (the miner equips the best pickaxe and follows connected ore) → `smelt_ores` turns it into ingots in a self-built furnace → `craft_gear` upgrades tools (diamond→iron→stone→wood per tool, using whatever it has).
+- **Food chain:** when no hostile threatens, `attack` hunts the nearest passive animal (cow/pig/sheep/chicken), then drops are collected off the ground and `eat` consumes the best food on hand — falling back to raw meat to avoid starvation. (A `cook_food` skill to multiply raw-meat value is on the roadmap.)
+- **Drop collection:** mining, gathering, and kills all walk the bot over the dropped items — nothing is left on the ground.
+
+### Self-Improvement Loop
+
+The team measures and improves itself across sessions:
+
+- **Scoreboard** (`logs/sessions/<id>.json`): per-bot success rates, deaths, stash throughput, and tech-tree milestone timestamps (first log → first tool → first iron...). Compare sessions to see whether a code change helped — and revert it if not.
+- **Skill curation**: skill success rates are aggregated team-wide. Skills with ≥8 real (non-precondition) failures and <10% success are retired; the prompt's skill list is ranked and annotated (`setup_stash (67% of 27)`) so the LLM prefers what works.
+- **Tech-tree curriculum**: every strategic prompt includes the bot's current tech stage and a concrete next step computed from its real inventory.
+- **Skill refinement** (Voyager-style): a dynamic skill that fails with a code error gets its source + error fed back to the LLM for a fixed version (old kept as `.bak`, 2 attempts/session).
+- **Fine-tuning pipeline** (`finetune/`): every strategic decision is logged (exact prompt → decision → outcome) to `logs/trajectories/`. `scripts/extract-finetune-dataset.mjs` turns successful trajectories into a chat-format dataset, and `finetune/train_lora.py` LoRA-tunes Qwen3-8B on the team's own gameplay — see `finetune/README.md` for the overnight recipe.
+
+### Safety
+
+All chat messages and bot thoughts are filtered:
+- Blocks harmful/inappropriate content
+- Detects and sanitizes prompt injection attempts from player chat
+- Viewer messages filtered separately with tighter rules
+
+---
+
+## Models
+
+The bots' decisions all run through a single local model that fits on one 32GB
+GPU. That model has changed several times as stronger local options appeared.
+This is the running record.
+
+| Model | Era | Type | Notes |
+|-------|-----|------|-------|
+| OpenAI GPT-3.5 / GPT-4 | 2023, single-bot origin | Cloud API | The original `mineflayer-chatgpt`: one bot on a cloud model. |
+| qwen3:32b + qwen3:8b | early multi-bot | Dense pair | Large model for strategy, small one for reactions. The two swapped in and out of VRAM and thrashed. |
+| qwen3.6:35b-a3b | June 2026 | MoE | One MoE for every decision type. ~3B active params, ~147 tok/s. Ended the two-model swap. |
+| qwen3-minecraft:8b | June 2026 | LoRA fine-tune | Qwen3-8B trained on the team's own successful games. 8.7GB, 138 tok/s. Played competently but did not beat the stock model. Reverted. |
+| qwen3.6:27b | late June 2026 | Dense | Stock model that beat the fine-tune. Baseline for the July trial. |
+| **gpt-oss:20b** | **July 2026 (current)** | **MoE** | **Won the three-way trial below. ~3.6B active params, ~200 tok/s, 13GB VRAM. Reasoning-native, runs at `think: "low"`.** |
+
+### July 2026 three-way trial
+
+Local-only, head to head, same world and prompts, with `qwen3.6:27b` as the baseline.
+
+| Metric | gpt-oss:20b | nemotron-3-nano | qwen3.6:27b |
+|--------|-------------|-----------------|-------------|
+| Eats / hour | **10** | 1.6 | 0.7 |
+| Action-failure rate | **31%** | n/a | 61% |
+| Decisions / hour | **~1,700** (≈8× qwen) | n/a | baseline |
+| VRAM | 13GB | n/a | n/a |
+
+`gpt-oss:20b` won on food economy, action success, skill success, and decision
+throughput. Deaths rose (2 → 5/hr) from sheer activity: about eight times more
+actions per hour, though each individual decision is safer than before.
+
+**Reasoning-native gotcha.** `qwen3.6` needs `think: false` or it burns its whole
+token budget reasoning. `gpt-oss` is the reverse: with `think: false` under
+`format: "json"` it terminates with empty content on roughly a third of queries
+(14 of 44 in one run). `thinkFor(model)` in `src/llm/index.ts` picks the level
+per model (`"low"` for gpt-oss, `false` for qwen). Same flag, opposite settings.
+
+---
+
+## Project Structure
+
+```
+minecraft-agent-swarm/
+├── src/
+│   ├── bot/
+│   │   ├── index.ts         # Bot lifecycle (connection, spawn safety)
+│   │   ├── brain.ts         # Event-driven decision engine
+│   │   ├── scoreboard.ts    # Session metrics + tech milestones
+│   │   ├── curriculum.ts    # Tech-tree next-goal proposal
+│   │   ├── trajectory.ts    # Fine-tuning data capture
+│   │   ├── navigation.ts    # safeGoto, drop collection, movements
+│   │   ├── actions.ts       # Action implementations
+│   │   ├── perception.ts    # World context builder
+│   │   ├── memory.ts        # Per-bot persistent memory (BotMemoryStore)
+│   │   ├── memory-registry.ts # Bot → memory store mapping
+│   │   ├── role.ts          # BotRoleConfig + all 5 bot configs
+│   │   └── bulletin.ts      # Team bulletin (shared status)
+│   ├── llm/
+│   │   └── index.ts         # Ollama client + JSON repair + system prompt
+│   ├── skills/
+│   │   ├── executor.ts      # Skill runner (abort support)
+│   │   ├── reliability.ts   # Team-wide skill stats + retirement
+│   │   ├── generator.ts     # Dynamic skill generator
+│   │   ├── dynamic-loader.ts# Voyager vm sandbox
+│   │   ├── registry.ts      # Skill registration
+│   │   ├── stash.ts         # Deposit/withdraw stash actions
+│   │   ├── setup-stash.ts   # Bootstrap shared chest area
+│   │   ├── build-house.ts
+│   │   ├── build-farm.ts
+│   │   ├── build-bridge.ts
+│   │   ├── craft-gear.ts
+│   │   ├── go-fishing.ts
+│   │   ├── light-area.ts
+│   │   ├── smelt-ores.ts
+│   │   └── strip-mine.ts
+│   ├── neural/
+│   │   ├── bridge.ts        # TCP client for neural server
+│   │   └── combat.ts        # 50ms tick combat loop
+│   ├── stream/
+│   │   ├── viewer.ts        # Per-bot prismarine-viewer
+│   │   ├── viewer-client.html # 3D viewer with camera modes
+│   │   ├── overlay.ts       # Per-bot OBS WebSocket overlay
+│   │   ├── dashboard.ts     # Mission Control server
+│   │   └── tts.ts           # Text-to-speech
+│   ├── safety/
+│   │   └── filter.ts        # Content safety filter
+│   ├── config.ts            # Env-based config
+│   └── index.ts             # Entry point — launches all bots
+├── dashboard/
+│   └── index.html           # Mission Control frontend
+├── overlay/
+│   └── index.html           # OBS overlay frontend
+├── skills/
+│   ├── voyager/             # 57 Voyager-style JS skills
+│   └── generated/store/     # Quarantined candidates and approved manifest (ignored)
+├── finetune/                # LoRA fine-tuning pipeline (see finetune/README.md)
+├── scripts/                 # Dataset extraction, skill downloads
+├── logs/
+│   ├── sessions/            # Scoreboard JSON per session (git-ignored)
+│   └── trajectories/        # Fine-tuning data JSONL (git-ignored)
+├── neural_server.py         # Python combat policy server
+├── memory-atlas.json        # Atlas memory (git-ignored)
+├── memory-flora.json        # Flora memory (git-ignored)
+├── memory-forge.json        # Forge memory (git-ignored)
+├── memory-mason.json        # Mason memory (git-ignored)
+├── memory-blade.json        # Blade memory (git-ignored)
+└── .env                     # Local config (git-ignored)
+```
+
+---
+
+## Known Issues
+
+| Issue | Status |
+|-------|--------|
+| Ollama JSON-schema `format` ignored | qwen3.6 on ollama 0.20.x returns prose for schema-constrained requests; plain `format:"json"` works (used). Re-test after upgrading ollama |
+| Pathfinder timeouts on some goals | Bounded + watchdog-backstopped (see Freeze Protection); bots recover via critic re-plan |
+| Food supply can't sustain 5 bots | Local-model ceiling: ~1 bot's intermittent farming oscillates; bots survive (Easy floors starvation at 10 HP) but productivity drops during hungry stretches |
+| Farms unbuilt unless water is near | `build_farm` needs water within range of the village site |
+| Neural combat untested in survival | Server is implemented and running; needs hostile mob environment |
+| Generated skills require Linux x64 + Bubblewrap | Disabled by default; `test:sandbox` is mandatory before opt-in, and promotion is manual by exact hash |
+
+---
+
+## Development
+
+```bash
+npm run dev     # Watch source and hot-reload individual skills
+npm test        # Run tests
+npm run build   # Compile TypeScript
+```
+
+Trusted skill edits under `src/skills` and `skills/voyager` are reloaded without
+restarting the process. Invalid edits leave the last working trusted skill registered.
+Generated candidates are never watched or host-loaded; use the verify/promote flow above.
+
+### Adding a New TypeScript Skill
+
+Read the [skill authoring guide](docs/skill-authoring-guide.md) for a tested example,
+cancellation, Voyager loading, and dynamic generation.
+
+1. Create `src/skills/my-skill.ts` exporting a `Skill` object from `src/skills/types.ts`; its `execute` method returns `Promise<SkillResult>`
+2. Register it in `src/skills/registry.ts`
+3. Add it to the appropriate bot's `allowedSkills` in `src/bot/role.ts`
+
+### Adding a Voyager Skill
+
+Drop a `.js` file into `skills/voyager/`. The function name must match the filename (camelCase). It will be loaded automatically by the dynamic loader.
+
+### Adding a New Bot
+
+1. Add a new `BotRoleConfig` in `src/bot/role.ts` with personality, allowed actions/skills, leash radius
+2. Add the config to the bot roster array in `src/index.ts`
+3. Add `MC_USERNAME_N` to `.env`
+4. Increment `BOT_COUNT`
+
+---
+
+## Run conditions (advancement run, updated 2026-09-07)
+
+The autonomous advancement run plays survival with two documented conditions:
+
+- **keepInventory is ON** — the run's one concession, approved by Jesse on
+  2026-09-07 after weighing the swarm's death rate (10-55/day) against the
+  five-minute despawn timer. It grants no advancements; it removes the item
+  penalty of dying. To be reconsidered once the swarm has an armor economy.
+- **No spawn commands** — the historical `/spawnpoint` + `/tp`-to-base respawn
+  plumbing was removed the same day. Bots respawn where the server says and
+  walk home; respawn points are earned the vanilla way by using beds.
+
+## Credits
+
+- Originated as `mineflayer-chatgpt` by Jesse Weigel (a single ChatGPT-driven bot)
+- Voyager skill library from [MineDreamer/Voyager](https://github.com/MineDreamer/Voyager)
+- Autonomous multi-agent swarm, local-LLM brain, neural combat, self-improvement loop, and streaming features added 2024–2026

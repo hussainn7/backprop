@@ -1,0 +1,26 @@
+node_modules/
+dist/
+.env
+/server/
+*.jar
+logs/*
+!logs/advancement-progress.csv
+memory.json
+firebase-debug.log
+/overlay/audio/thought-*.mp3
+/overlay/audio/.thought-*.mp3.part
+
+skills/generated/*.js
+skills/generated/store/
+memory-*.json
+.playwright-mcp/
+*.png
+finetune/.venv/
+finetune/dataset.jsonl
+finetune/*-lora*/
+finetune/*.gguf
+.advancement-extract/
+logs/known-nests.json
+
+# world backups (large archives; see ops/README.md)
+backups/
