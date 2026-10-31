@@ -14,6 +14,8 @@ import { startViewer } from "../stream/viewer.js";
 import { addChatMessage, setCurrentBot } from "../stream/overlay.js";
 import { abortActiveSkill, getActiveSkillName } from "../skills/executor.js";
 import { registerBotMemory } from "./memory-registry.js";
+import { PlanStore } from "../plan/state.js";
+import { registerBotPlan } from "../plan/registry.js";
 import { skillRegistry } from "../skills/registry.js";
 import { BotMemoryStore } from "./memory.js";
 import { BotRoleConfig, ATLAS_CONFIG } from "./role.js";
@@ -113,6 +115,14 @@ export async function createBot(events: BrainEvents, roleConfig: BotRoleConfig =
   bot.once("login", () => registerSquadBot(bot));
 
   registerBotMemory(bot, memStore);
+
+  // Hierarchical plan state. One file per bot, named plan-<bot>.json next
+  // to memory-<bot>.json so the two share a lifecycle. Load before login
+  // so the first strategic prompt already has an active medium.
+  const planFile = roleConfig.memoryFile.replace(/^memory-/, "plan-").replace(/^memory\.json$/, "plan.json");
+  const planStore = new PlanStore(planFile);
+  planStore.load();
+  registerBotPlan(bot, planStore);
 
   // Safety guards. Mineflayer attaches chat/attack via plugins after
   // createBot() returns, so they are wrapped on login, before any action runs.

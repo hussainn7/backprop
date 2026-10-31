@@ -85,6 +85,8 @@ import { updateBulletin, formatTeamBulletin } from "./bulletin.js";
 import { createLogger } from "../util/logger.js";
 import { recordAction, recordSkillResult, checkInventoryMilestones } from "./scoreboard.js";
 import { getTechTreeLine } from "./curriculum.js";
+import { getPlanLine } from "../plan/line.js";
+import { getBotPlan } from "../plan/registry.js";
 import { advancementLine } from "./advancement-line.js";
 import { readTeamEarned } from "./advancement-progress.js";
 import { recordTrajectory, type TrajectoryModelMetadata } from "./trajectory.js";
@@ -1369,13 +1371,30 @@ export class BotBrain {
       this.pendingChatMessages.length = 0;
     }
 
-    // Tech-tree curriculum — deterministic "what's next" from inventory
-    const techLine = getTechTreeLine(this.bot, this.roleConfig.role);
-    if (techLine) ctx += `\n\n${techLine}`;
+    // Hierarchical plan (long → medium → short). Advisory only; the LLM
+    // still picks the actual action. Prefer this over the TECH TREE line
+    // when the planner has an active medium — the plan line already
+    // encodes "what next" at finer granularity. If idle (dragon chain
+    // complete, or planner unavailable), fall back to the tech line.
+    const earned = readTeamEarned(BOT_ROSTER.map((b) => b.name));
+    const mem = getBotMemoryStore(this.bot);
+    const planOpts = {
+      earnedAdvancements: earned,
+      hasShelter: mem ? mem.hasStructureNearby("house", 0, 0, 0, 1_000_000) : false,
+      hasFarm: mem ? mem.hasStructureNearby("farm", 0, 0, 0, 1_000_000) : false,
+    };
+    const planLine = getPlanLine(this.bot, planOpts);
+    if (planLine) {
+      ctx += `\n\n${planLine}`;
+    } else {
+      const techLine = getTechTreeLine(this.bot, this.roleConfig.role);
+      if (techLine) ctx += `\n\n${techLine}`;
+    }
 
     // Ground truth from the server, not from the bot's own claims. Cached by
     // readTeamEarned's caller cadence — buildContext runs at most every ~10s.
-    const advLine = advancementLine(this.roleConfig.role, readTeamEarned(BOT_ROSTER.map((b) => b.name)));
+    // Reuses `earned` fetched for the plan line above (same tick).
+    const advLine = advancementLine(this.roleConfig.role, earned);
     if (advLine) ctx += `\n\n${advLine}`;
 
     // Current goal
@@ -5585,6 +5604,7 @@ export class BotBrain {
       timestamp: Date.now(),
       goal: this.currentGoal || decision.goal,
       lastResult: result.slice(0, 120),
+      mediumGoal: getBotPlan(this.bot)?.snapshot().activeMedium ?? undefined,
     });
 
     // Update overlay with result
@@ -5619,6 +5639,26 @@ export class BotBrain {
       recordSkillResult(this.roleConfig.name, isSuccess);
     }
     checkInventoryMilestones(this.bot, this.roleConfig.name);
+
+    // Hierarchical plan: a failed attempt on the current short step counts
+    // against the active medium. Three strikes blocks it for 15 minutes so
+    // pickMedium rotates onto something else; the chain is NOT abandoned
+    // and the medium becomes eligible again when the TTL expires. Only the
+    // tracker fires here — the planner itself is pure-functional.
+    if (!isSuccess) {
+      const plan = getBotPlan(this.bot);
+      if (plan?.snapshot().activeMedium && plan.snapshot().activeShortId) {
+        const attempts = plan.recordShortFailure();
+        if (attempts >= 3) {
+          const until = Date.now() + 15 * 60_000;
+          const blocked = plan.snapshot().activeMedium;
+          plan.blockActiveMedium(until);
+          console.log(
+            `[Plan] ${this.roleConfig.name} medium "${blocked}" blocked for 15 min after ${attempts} failed attempts on ${plan.snapshot().activeShortId ?? "step"}`,
+          );
+        }
+      }
+    }
 
     // Track repeats
     if (decision.action !== "idle") {
