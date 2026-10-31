@@ -47,6 +47,7 @@ import { generateSpeech } from "../stream/tts.js";
 import { filterContent, filterChatMessage, filterViewerMessage } from "../safety/filter.js";
 import { abortActiveSkill, isSkillRunning, getActiveSkillName, takeSkillOutcome } from "../skills/executor.js";
 import { milestoneGoalLine } from "../monitor/ops.js";
+import { currentMode } from "./hunt-mode.js";
 import {
   archetypeOf,
   squadName,
@@ -1037,6 +1038,7 @@ export class BotBrain {
    * close, reachable, and the bot is armed and healthy. Never chases him far.
    */
   private async huntOverride(): Promise<boolean> {
+    if (currentMode() !== "hunt") return false; // game mode: leave him alone
     const target = huntTargetEntity(this.bot);
     const me = this.bot.entity?.position;
     if (!target || !me || isSkillRunning(this.bot)) return false;

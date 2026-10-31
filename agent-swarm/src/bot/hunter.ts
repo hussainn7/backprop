@@ -1,6 +1,7 @@
 // src/bot/hunter.ts
 //
-// HUNT_MODE=primary: while HUNT_PLAYER is in survival mode, every bot drops
+// Hunt mode (`!mode hunt`, or HUNT_MODE=primary until set in game): while
+// HUNT_PLAYER is in survival mode, every bot drops
 // what it is doing and hunts him down. The brain is paused for the duration
 // (its skills and squad logic would otherwise steer the bot away mid-chase)
 // and resumed when he leaves survival, logs off, or changes dimension.
@@ -17,15 +18,19 @@ import type { Bot } from "mineflayer";
 import type { Entity } from "prismarine-entity";
 import { Vec3 } from "vec3";
 import pkg from "mineflayer-pathfinder";
-import { huntPlayer, ALL_BOT_NAMES, SQUAD } from "./squad.js";
-import { CombatLearner, availableTactics, stateKey, type CombatState, type Tactic } from "../learn/combat-learner.js";
+import { huntPlayer, ALL_BOT_NAMES, SQUAD, leaderBot } from "./squad.js";
+import { CombatLearner, availableTactics, stateKey, type CombatState, type Tactic, type TargetMotion } from "../learn/combat-learner.js";
+import { huntIsPrimary } from "./hunt-mode.js";
+import { latestSighting, predict, reportSighting } from "./sighting.js";
+import { say, fmt, requestHelp, clearHelp, helpRequests } from "./team-comms.js";
+import { isHostile } from "./perception.js";
 import { PearlAim, trajectory } from "../learn/pearl-aim.js";
 import { baseMoves } from "./navigation.js";
 import { abortActiveSkill, isSkillRunning } from "../skills/executor.js";
 
 const { goals } = pkg;
 
-export const huntIsPrimary = (): boolean => !!huntPlayer() && process.env.HUNT_MODE === "primary";
+export { huntIsPrimary };
 
 // ── Server-side tracker (one per process, shared by its five bots) ─────────
 interface Tracked {
@@ -222,31 +227,60 @@ export function learners(): { combat: CombatLearner; pearl: PearlAim } {
           `kills ${s.kills}, deaths ${s.deaths}${last !== undefined ? `, mean reward (last 25) ${last.toFixed(2)}` : ""}`,
       );
     }, 60_000).unref();
+    // Every 3 min in hunt mode the squad leader reports what the squad has learned.
+    setInterval(() => {
+      const lb = leaderBot();
+      if (!lb || !huntIsPrimary()) return;
+      const s = l.summary();
+      if (!s.updates) return;
+      const pick = (dist: string, situation: string) => s.policy.find((r) => r.dist === dist && r.situation === situation)?.tactic ?? "?";
+      say(
+        lb,
+        "learned",
+        `Squad ${SQUAD} learning: ${s.updates} fight decisions so far. Up close I'd ${pick("≤3", "fighting")}; ` +
+          `if he runs at 12-24 blocks: ${pick("12–24", "fleeing")}; when he's busy with a teammate at 6-12: ${pick("6–12", "fighting")}.`,
+        170_000,
+      );
+    }, 180_000).unref();
   }
   return { combat: learner, pearl: aimModel };
 }
 
 const DECISION_MS = 1200;
+/**
+ * Potential for reward shaping, Φ = −distance/4; the shaping term is Φ(s′) − Φ(s),
+ * so closing in pays, backing off costs and standing still is neutral. (Round 1
+ * used γΦ(s′) − Φ(s) with γ = 0.8, which quietly paid ~+1 per window just for
+ * standing 20+ blocks away; bots learned to retreat. γ = 1 removes that bias.)
+ */
+const potential = (dist: number) => -Math.min(dist, 40) / 4;
+
+// Hits on the target by any bot of this squad: the team part of the reward.
+let teamHits = 0;
+let lastCallout = 0;
 
 interface Window {
   state: CombatState;
   tactic: Tactic;
   explored: boolean;
   start: number;
-  dist0: number;
   hits: number;
+  teamHitsAtStart: number;
+  mobHits: number;
   hpLost: number;
   side: "left" | "right";
+  guarding: boolean;
 }
 
 export function startHunter(bot: Bot, brain: Pausable): void {
   const name = huntPlayer();
-  if (!huntIsPrimary()) return;
+  if (!name) return;
   startTracker(name);
   const { combat, pearl } = learners();
 
   let hunting = false;
   let lastSwing = 0;
+  let lastMobSwing = 0;
   let lastGoal: Vec3 | null = null;
   let followed: Entity | null = null;
   let goalKind = "";
@@ -256,6 +290,8 @@ export function startHunter(bot: Bot, brain: Pausable): void {
   let win: Window | null = null;
   let pearlBusy = false;
   let lastHp = 20;
+  let lastTargetSwing = 0;
+  let lastTargetHurt = 0;
 
   // A raised shield slows the bot to sneaking speed: lower it to run or swing.
   const lowerShield = () => {
@@ -265,21 +301,48 @@ export function startHunter(bot: Bot, brain: Pausable): void {
   };
 
   const pearls = () => bot.inventory.items().filter((i) => i.name === "ender_pearl").reduce((n, i) => n + i.count, 0);
+  const dimension = () => String(bot.game.dimension ?? "overworld");
 
+  const nearestMob = (radius: number) => {
+    const me = bot.entity?.position;
+    if (!me) return null;
+    return bot.nearestEntity((e) => e !== bot.entity && !!e.position && isHostile(e) && e.position.distanceTo(me) <= radius);
+  };
+
+  /** Raw state for the learner; which tactic is good in it is learned, not coded. */
   const observe = (ent: Entity): CombatState => {
     const me = bot.entity.position;
     const flags = Number((ent as unknown as { metadata?: unknown[] }).metadata?.[8] ?? 0);
     let allies = 0;
+    let alliesClose = 0;
     for (const n of ALL_BOT_NAMES) {
+      if (n === bot.username) continue;
       const e = bot.players[n]?.entity;
-      if (e && e.position.distanceTo(ent.position) <= 6) allies++;
+      if (!e) continue;
+      const d = e.position.distanceTo(ent.position);
+      if (d <= 6) allies++;
+      if (d <= 4) alliesClose++;
     }
+    // Radial speed from the spotter board's velocity estimate: + is away from us.
+    const s = latestSighting(dimension(), 2500);
+    let motion: TargetMotion = "still";
+    if (s) {
+      const away = ent.position.minus(me);
+      const len = Math.hypot(away.x, away.z) || 1;
+      const radial = (s.vel.x * away.x + s.vel.z * away.z) / len;
+      motion = radial > 1.5 ? "fleeing" : radial < -1.5 ? "approaching" : "still";
+    }
+    const now = Date.now();
     return {
       dist: ent.position.distanceTo(me),
       hp: bot.health,
       targetShielding: (flags & 0x01) === 1,
       dy: ent.position.y - me.y,
       alliesNearTarget: allies,
+      targetMotion: motion,
+      targetBusy: now - lastTargetSwing < 2000 || now - lastTargetHurt < 2000 || alliesClose > 0,
+      mobAdjacent: !!nearestMob(4),
+      allyHurt: helpRequests(bot.username, me, dimension()).length > 0,
     };
   };
 
@@ -290,35 +353,50 @@ export function startHunter(bot: Bot, brain: Pausable): void {
     goalKind = "";
   };
 
-  /** Close the current window: score it, update Q, log the experience. */
+  /**
+   * Close the current window, score it and update Q. The reward:
+   *   +1 per own hit on him, +0.25 per squadmate hit (team play), +0.3 per hit
+   *   on a mob that is on us, −0.5 per HP lost, −0.05 per window (finish fast),
+   *   + potential-based shaping γΦ(s′) − Φ(s) with Φ = −distance/4,
+   *   +10 for the kill, +5 when a squadmate gets it, −10 for dying.
+   */
   const finish = (next: CombatState | null, terminal: "kill" | "death" | null, teamKill = false) => {
     if (!win) return;
     const w = win;
     win = null;
-    const dist1 = next?.dist ?? w.dist0;
-    const closed = w.dist0 > 4 ? Math.max(-5, Math.min(10, w.dist0 - dist1)) : 0;
-    let reward = w.hits * 1.0 - w.hpLost * 0.5 + closed / 5;
+    const others = Math.max(0, teamHits - w.teamHitsAtStart - w.hits);
+    w.guarding = !!bot.entity && helpRequests(bot.username, bot.entity.position, dimension(), 5).length > 0;
+    const shaping = next && !terminal ? potential(next.dist) - potential(w.state.dist) : 0;
+    let reward = w.hits * 1.0 + others * 0.25 + w.mobHits * 0.3 - w.hpLost * 0.5 - 0.05 + shaping;
+    // Bodyguard: ending the window beside a teammate who called for help.
+    if (w.guarding) reward += 0.5;
     if (terminal === "kill") reward += 10;
     if (terminal === "death") reward -= 10;
-    if (teamKill) reward += 2;
+    if (teamKill) reward += 5;
     const nextOptions = next ? availableTactics(next, pearls(), shieldInOffhand(bot)) : [];
-    combat.update(w.state, w.tactic, reward, terminal ? null : next, nextOptions);
+    combat.update(w.state, w.tactic, reward, terminal || teamKill ? null : next, nextOptions);
+    const st = w.state;
     combat.record({
       ts: new Date().toISOString(),
       bot: bot.username,
-      state: `${w.state.dist.toFixed(1)}b hp${w.state.hp.toFixed(0)}${w.state.targetShielding ? " shield" : ""}`,
+      state:
+        `${st.dist.toFixed(1)}b hp${st.hp.toFixed(0)} ${st.targetMotion}` +
+        `${st.targetBusy ? " busy" : ""}${st.targetShielding ? " shield" : ""}${st.mobAdjacent ? " mob" : ""}${st.allyHurt ? " allyhurt" : ""} al${st.alliesNearTarget}`,
       tactic: w.tactic,
       explored: w.explored,
-      epsilon: +combat.stateEpsilon(stateKey(w.state)).toFixed(3),
+      epsilon: +combat.stateEpsilon(stateKey(st)).toFixed(3),
       reward: +reward.toFixed(2),
       hits: w.hits,
+      teamHits: others,
+      mobHits: w.mobHits,
       damageTaken: +w.hpLost.toFixed(1),
-      closed: +closed.toFixed(1),
-      terminal,
+      closed: +((next?.dist !== undefined ? st.dist - next.dist : 0)).toFixed(1),
+      terminal: terminal ?? (teamKill ? "team_kill" : null),
     });
-    if (w.hits || terminal || w.tactic.startsWith("pearl")) {
+    if (w.hits || w.mobHits || terminal || teamKill || w.tactic.startsWith("pearl")) {
       console.log(
-        `[Learn] ${bot.username} ${w.tactic}${w.explored ? " (explore)" : ""}: hits ${w.hits}, took ${w.hpLost.toFixed(0)}, reward ${reward.toFixed(2)}${terminal ? ` [${terminal}]` : ""}`,
+        `[Learn] ${bot.username} ${w.tactic}${w.explored ? " (explore)" : ""}: hits ${w.hits}, team ${others}, mob ${w.mobHits}, ` +
+          `took ${w.hpLost.toFixed(0)}, reward ${reward.toFixed(2)}${terminal ? ` [${terminal}]` : teamKill ? " [team kill]" : ""}`,
       );
     }
   };
@@ -360,6 +438,13 @@ export function startHunter(bot: Bot, brain: Pausable): void {
     return null;
   };
 
+  const escapePoint = (ent: Entity) => {
+    const me = bot.entity.position;
+    const away = me.minus(ent.position);
+    const len = Math.hypot(away.x, away.z) || 1;
+    return new Vec3(me.x + (away.x / len) * 20, me.y, me.z + (away.z / len) * 20);
+  };
+
   /** Throw a pearl at a point using the learned aim; learn from where we land. */
   const throwPearl = async (point: Vec3, why: string) => {
     const item = bot.inventory.items().find((i) => i.name === "ender_pearl");
@@ -398,7 +483,7 @@ export function startHunter(bot: Bot, brain: Pausable): void {
       const lateral = rz * fx - rx * fz;
       // A teleport from elsewhere (death, an admin /tp) is not a pearl landing.
       if (forward > 0.5 && forward < 70 && Math.abs(lateral) < 8) {
-        pearl.learn(bot.username, pitch, { d, dy }, { forward, lateral, dy: landed.y - start.y }, arc as "low" | "high");
+        pearl.learn(bot.username, pitch, { d, dy }, { forward, lateral, dy: landed.y - start.y }, arc);
         const err = Math.hypot(forward - d, lateral, landed.y - start.y - dy);
         console.log(`[Learn] ${bot.username} pearl (${why}, ${arc} arc) aimed ${d.toFixed(1)} blocks, landed ${err.toFixed(1)} off target`);
       }
@@ -412,6 +497,7 @@ export function startHunter(bot: Bot, brain: Pausable): void {
   };
 
   const stop = (why: string) => {
+    clearHelp(bot.username);
     if (!hunting) return;
     finish(null, null);
     resetMotion();
@@ -440,7 +526,7 @@ export function startHunter(bot: Bot, brain: Pausable): void {
   const act = (ent: Entity, tactic: Tactic, dist: number, now: number) => {
     const ready = now - lastSwing >= swingMs(bot);
     const inReach = dist <= 3.4;
-    if (inReach && tactic !== "retreat") void bot.lookAt(ent.position.offset(0, (ent.height ?? 1.8) * 0.85, 0), true);
+    if (inReach && tactic !== "retreat" && tactic !== "defend") void bot.lookAt(ent.position.offset(0, (ent.height ?? 1.8) * 0.85, 0), true);
     switch (tactic) {
       case "rush":
         follow(ent, "follow");
@@ -497,30 +583,88 @@ export function startHunter(bot: Bot, brain: Pausable): void {
       case "retreat":
         follow(ent, "retreat");
         break;
+      case "defend": {
+        const mob = nearestMob(4.5);
+        if (!mob) {
+          follow(ent, "follow"); // the mob is gone: back to him
+          if (inReach && ready) swing(ent);
+          break;
+        }
+        if (followed) {
+          bot.pathfinder.setGoal(null);
+          followed = null;
+          goalKind = "";
+        }
+        void bot.lookAt(mob.position.offset(0, (mob.height ?? 1.6) * 0.8, 0), true);
+        bot.setControlState("forward", mob.position.distanceTo(bot.entity.position) > 2.8);
+        if (now - lastSwing >= swingMs(bot) && mob.position.distanceTo(bot.entity.position) <= 3.4) {
+          lowerShield();
+          lastSwing = now;
+          lastMobSwing = now;
+          bot.attack(mob);
+        }
+        break;
+      }
+      case "backup": {
+        const r = helpRequests(bot.username, bot.entity.position, dimension())[0];
+        if (!r) {
+          follow(ent, "follow"); // nobody needs help any more: back on him
+          if (inReach && ready) swing(ent);
+          break;
+        }
+        // Go stand with the hurt teammate; fight whatever is there, him first.
+        if (!lastGoal || lastGoal.distanceTo(r.pos) > 3 || goalKind !== "backup") {
+          lastGoal = r.pos.clone();
+          followed = null;
+          goalKind = "backup";
+          bot.pathfinder.setGoal(new goals.GoalNear(r.pos.x, r.pos.y, r.pos.z, 2));
+        }
+        if (inReach && ready) swing(ent);
+        else {
+          const mob = nearestMob(3.4);
+          if (mob && now - lastSwing >= swingMs(bot)) {
+            void bot.lookAt(mob.position.offset(0, (mob.height ?? 1.6) * 0.8, 0), true);
+            lowerShield();
+            lastSwing = now;
+            lastMobSwing = now;
+            bot.attack(mob);
+          }
+        }
+        break;
+      }
       case "pearl_close":
-        if (!pearlBusy) void throwPearl(ent.position.clone(), "close the gap");
+        if (!pearlBusy) {
+          say(bot, "pearl", `Pearling in on ${name}!`, 15_000);
+          void throwPearl(ent.position.clone(), "close the gap");
+        }
         break;
       case "pearl_escape":
-        if (!pearlBusy) {
-          const me = bot.entity.position;
-          const away = me.minus(ent.position);
-          const len = Math.hypot(away.x, away.z) || 1;
-          void throwPearl(new Vec3(me.x + (away.x / len) * 20, me.y, me.z + (away.z / len) * 20), "escape");
-        }
+        if (!pearlBusy) void throwPearl(escapePoint(ent), "escape");
         break;
     }
   };
 
   const tick = () => {
     if (!bot.entity || bot.health <= 0) return;
+    if (!huntIsPrimary()) return stop("game mode");
     const info = bot.players[name];
     if (!info || info.gamemode !== 0) return stop(info ? "not in survival" : "offline");
     const ent = info.entity && info.entity.isValid ? info.entity : null;
-    const remote = tracked && Date.now() - tracked.at < 6000 && sameDimension(tracked.dimension, bot.game.dimension) ? tracked.pos : null;
-    const target = ent?.position ?? remote;
+    const now = Date.now();
+
+    // Where is he? Own eyes, then a squadmate's sighting projected forward,
+    // then the server's record.
+    if (ent) {
+      if (reportSighting(ent.position, bot.username, dimension()) && now - lastCallout > 20_000) {
+        lastCallout = now;
+        say(bot, "spotted", `Spotted ${name} at ${fmt(ent.position)}. Everyone on him!`, 20_000);
+      }
+    }
+    const seen = ent ? null : latestSighting(dimension());
+    const remote = tracked && now - tracked.at < 6000 && sameDimension(tracked.dimension, bot.game.dimension) ? tracked.pos : null;
+    const target = ent?.position ?? seen?.pos ?? remote;
     if (!target) return stop("not in this dimension");
 
-    const now = Date.now();
     if (!hunting) {
       hunting = true;
       brain.pause();
@@ -532,6 +676,13 @@ export function startHunter(bot: Bot, brain: Pausable): void {
       bot.pathfinder.setMovements(moves);
       lastHp = bot.health;
       console.log(`[Hunt] ${bot.username} hunting ${name} (${target.distanceTo(bot.entity.position).toFixed(0)} blocks away, ${pearls()} pearls)`);
+    }
+    // Call for backup while hurt; withdraw the call once healed.
+    if (bot.health <= 8) {
+      requestHelp(bot.username, bot.entity.position, bot.health, dimension());
+      say(bot, "help", `${Math.round(bot.health)} HP at ${fmt(bot.entity.position)}, need backup!`, 15_000);
+    } else if (bot.health > 12) {
+      clearHelp(bot.username);
     }
     if (pearlBusy) return;
     if (now - lastEquip > 5000) {
@@ -546,41 +697,63 @@ export function startHunter(bot: Bot, brain: Pausable): void {
         const state = observe(ent);
         const prevTactic = win?.tactic;
         finish(state, null);
-        // Only offer a pearl tactic when a clear arc exists right now.
-        const options = availableTactics(state, pearls(), shieldInOffhand(bot)).filter((t) => {
-          if (t === "pearl_close") return !!planThrow(ent.position);
-          if (t === "pearl_escape") {
-            const me = bot.entity.position;
-            const away = me.minus(ent.position);
-            const len = Math.hypot(away.x, away.z) || 1;
-            return !!planThrow(new Vec3(me.x + (away.x / len) * 20, me.y, me.z + (away.z / len) * 20));
-          }
-          return true;
-        });
+        // Physically possible tactics; pearls only when a clear arc exists.
+        const options = availableTactics(state, pearls(), shieldInOffhand(bot)).filter((t) =>
+          t === "pearl_close" ? !!planThrow(ent.position) : t === "pearl_escape" ? !!planThrow(escapePoint(ent)) : true,
+        );
         const { tactic, explored } = combat.choose(state, options);
         if (tactic !== prevTactic) resetMotion();
-        win = { state, tactic, explored, start: now, dist0: state.dist, hits: 0, hpLost: 0, side: Math.random() < 0.5 ? "left" : "right" };
+        win = {
+          state,
+          tactic,
+          explored,
+          start: now,
+          hits: 0,
+          teamHitsAtStart: teamHits,
+          mobHits: 0,
+          hpLost: 0,
+          side: Math.random() < 0.5 ? "left" : "right",
+          guarding: false,
+        };
+        if (tactic === "backup") {
+          const r = helpRequests(bot.username, bot.entity.position, dimension())[0];
+          if (r) say(bot, "backup", `On my way, ${r.bot}! Holding on at ${fmt(r.pos)}.`, 12_000);
+        }
       }
       act(ent, win.tactic, dist, now);
     } else {
-      // Out of sight: path to his tracked position, no learning.
+      // Not in sight: no learning. Head for where he WILL be (intercept), using
+      // a squadmate's sighting and his velocity, else his last known position.
       finish(null, null);
       if (followed || goalKind) resetMotion();
-      if (!lastGoal || lastGoal.distanceTo(target) > 4 || !bot.pathfinder.isMoving()) {
-        lastGoal = target.clone();
-        bot.pathfinder.setGoal(new goals.GoalNear(target.x, target.y, target.z, 2));
+      const aim = seen ? predict(seen, (now - seen.at) / 1000 + dist / 5.6) : target;
+      if (!lastGoal || lastGoal.distanceTo(aim) > 4 || !bot.pathfinder.isMoving()) {
+        lastGoal = aim.clone();
+        bot.pathfinder.setGoal(new goals.GoalNear(aim.x, aim.y, aim.z, 2));
       }
     }
     if (now - lastLog > 30_000) {
       lastLog = now;
-      console.log(`[Hunt] ${bot.username} -> ${name}: ${dist.toFixed(0)} blocks${ent ? " (in sight)" : " (tracked)"}`);
+      const how = ent ? "in sight" : seen ? `spotted by ${seen.by}` : "server position";
+      console.log(`[Hunt] ${bot.username} -> ${name}: ${dist.toFixed(0)} blocks (${how})`);
     }
   };
 
-  // ── Reward signals ──
+  // ── Reward and state signals ──
   bot.on("entityHurt", (e: Entity) => {
-    if (!win || e.username !== name) return;
-    if (Date.now() - lastSwing < 600 && e.position.distanceTo(bot.entity.position) <= 4.5) win.hits++;
+    const now = Date.now();
+    if (e.username === name) {
+      lastTargetHurt = now;
+      if (win && now - lastSwing < 600 && e.position.distanceTo(bot.entity.position) <= 4.5) {
+        win.hits++;
+        teamHits++;
+      }
+    } else if (win && e !== bot.entity && isHostile(e) && now - lastMobSwing < 600 && e.position.distanceTo(bot.entity.position) <= 4.5) {
+      win.mobHits++;
+    }
+  });
+  bot.on("entitySwingArm", (e: Entity) => {
+    if (e.username === name) lastTargetSwing = Date.now();
   });
   bot.on("health", () => {
     if (win && bot.health < lastHp) win.hpLost += lastHp - bot.health;
@@ -588,10 +761,18 @@ export function startHunter(bot: Bot, brain: Pausable): void {
   });
   bot.on("messagestr", (msg: string) => {
     if (!win || !msg.startsWith(`${name} `)) return;
-    if (msg.endsWith(` ${bot.username}`) || msg.includes(` by ${bot.username}`)) finish(null, "kill");
+    if (msg.endsWith(` ${bot.username}`) || msg.includes(` by ${bot.username}`)) {
+      finish(null, "kill");
+      say(bot, "kill", `Got him! ${name} is down.`, 5_000);
+    }
     else if (ALL_BOT_NAMES.some((b) => msg.includes(` by ${b}`))) finish(null, null, true);
   });
   bot.on("death", () => {
+    if (win) {
+      const p = bot.players[name]?.entity?.position ?? latestSighting(dimension(), 4000)?.pos;
+      say(bot, "down", p ? `I'm down. ${name} is at ${fmt(p)}, finish him!` : "I'm down!", 10_000);
+    }
+    clearHelp(bot.username);
     finish(null, "death");
     followed = null;
     goalKind = "";

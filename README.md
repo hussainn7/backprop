@@ -54,22 +54,56 @@ nothing is scripted per tactic outcome: every number below is learned live on th
 The opponent is the owner (`HUNT_PLAYER`, `HUNT_MODE=primary`): while he plays survival,
 all ten bots hunt him, and every engagement is training data.
 
-### 1. Combat policy: tabular Q-learning (`src/learn/combat-learner.ts`)
+### 1. Combat policy: Q-learning with a linear model (`src/learn/combat-learner.ts`)
 
 Each bot in sight of the target makes a decision every 1.2 s.
 
 | | |
 |---|---|
-| **State** (270) | distance bucket (≤3, 3–6, 6–12, 12–24, >24) × own health (≤6, ≤12, >12) × target shielding? × height difference (below, level, above) × allies near target (0, 1–2, 3+) |
-| **Actions** (8) | `rush` sprint-hit · `crit` jump and strike while falling (1.5× damage) · `wtap` sprint-hit then release for extra knockback · `shield` advance blocking, drop to swing · `strafe` circle-strafe · `retreat` · `pearl_close` pearl next to the target · `pearl_escape` pearl away when hurt |
-| **Reward** | +1 per hit landed (the target's hurt animation within 600 ms of our swing) − 0.5 per HP lost + distance closed / 5 + 10 for the kill (from the server's death message) − 10 for dying + 2 when a squadmate gets the kill |
-| **Update** | Q(s,a) ← Q(s,a) + α [r + γ·maxₐ′ Q(s′,a′) − Q(s,a)], α = 0.2, γ = 0.6 |
-| **Exploration** | ε-greedy with a per-state rate ε(s) = max(0.05, 0.5/√(1 + visits(s))), untried tactics first: common situations exploit what was learned, rare ones keep experimenting |
+| **State features** (22) | bias · distance (≤3, 3–6, 6–12, 12–24, >24) · own health (≤6, ≤12, >12) · target shielding · height (below, level, above) · allies near target (0, 1–2, 3+) · target motion relative to the bot (still, approaching, fleeing) · target **busy** fighting (swung or was hit in the last 2 s, or a teammate is on him) · a mob on the bot · a teammate **calling for help** |
+| **Actions** (10) | `rush` · `crit` (jump, hit while falling: 1.5×) · `wtap` · `shield` · `strafe` · `retreat` · `pearl_close` · `pearl_escape` · `defend` (kill the mob on you) · `backup` (run to a hurt teammate and fight beside them) |
+| **Model** | Q(s,a) = w_a · φ(s), one weight vector per tactic; what is learned in one situation carries over to similar ones |
+| **Update** | w_a += (η/‖φ‖²)·(r + γ·max Q(s′,·) − Q(s,a))·φ(s), η = 0.3, γ = 0.8 (semi-gradient Q-learning) |
+| **Reward** | +1 per own hit on the target, **+0.25 per squadmate hit** (team play), +0.3 per hit on a mob that is on you, +0.5 for ending beside a teammate who called for help, −0.5 per HP lost, −0.05 per decision (finish fast), + distance-shaping Φ(s′) − Φ(s) with Φ = −distance/4, +10 kill, +5 squadmate kill, −10 death |
+| **Exploration** | ε-greedy with a per-state rate ε(s) = max(0.05, 0.5/√(1 + visits(s))) |
 
-All five bots of a squad share one Q-table, so a lesson one bot learns is used by all
-five on their next decision. The table persists in `agent-swarm/logs/learning/combat-q-<squad>.json`
-and every decision (state, tactic, explored?, reward, hits, damage) is appended to
-`combat-experience-<squad>.jsonl` so learning can be audited or replayed offline.
+Which tactic fits which situation is never hard-coded; only what is physically possible is
+(pearls need pearls and a clear arc, `defend` needs a mob, `backup` needs a call for help).
+A unit test trains the model only at 10 blocks ("rush when he is busy, pearl when he flees")
+and checks it already chooses correctly at 20 blocks.
+
+All five bots of a squad share one model. It persists in `agent-swarm/logs/learning/combat-v2-<squad>.json`,
+and every decision is appended to `combat-experience-v2-<squad>.jsonl`. The v1 lookup-table
+logs are kept as the baseline.
+
+**Measured (same opponent, raw outcomes per bot per engaged minute):**
+
+| | v1 table (3,244 decisions) | v2 round 1 (2,452 decisions) |
+|---|---|---|
+| hits on the target | 14.4 / min | **22.7 / min (+57 %)** |
+| damage taken | 14.0 / min | **12.3 / min (−12 %)** |
+| deaths | 37 / h | 34 / h |
+| pearl decisions | 14 % | 5.5 % |
+
+Round 1 also exposed a shaping bug (γΦ(s′) − Φ(s) with γ = 0.8 paid bots for standing far
+away, so retreats doubled to 21 %); round 2 uses Φ(s′) − Φ(s).
+
+### Team play: spotting, callouts, backup
+
+* **Spotter board** (`src/bot/sighting.ts`): any bot that sees the target publishes his
+  position and velocity; the other squad reads it from `logs/sighting.json`. Bots that
+  cannot see him path to where he *will* be (position + velocity × time-to-reach).
+* **Chat callouts** (`src/bot/team-comms.ts`, rate-limited): "Spotted SirFinnn at x y z",
+  "6 HP at x y z, need backup!", "On my way, Flora!", "Pearling in!", "Got him!",
+  "I'm down, he's at x y z", and every 3 min each leader reports what its squad has learned.
+* **Help board**: a bot at 8 HP or less posts a help request (`logs/help.json`); teammates
+  within 40 blocks get the `ally hurt` feature and the learned `backup` tactic.
+
+### Modes
+
+`!mode hunt` (all bots hunt `HUNT_PLAYER` while he is in survival) or `!mode game` (back to
+beating the game); `!mode` shows the current one. Stored in `logs/hunt-mode.json`, shared
+by both squads; `HUNT_MODE=primary` in `.env` is the default until set in game.
 
 ### 2. Ender-pearl aim: physics prior + learned correction (`src/learn/pearl-aim.ts`)
 

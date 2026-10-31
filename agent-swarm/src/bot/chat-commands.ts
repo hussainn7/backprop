@@ -3,7 +3,8 @@ import { filterViewerMessage } from "../safety/filter.js";
 export type ChatCommand =
   | { name: "status" | "come" | "stay" | "resume" | "inventory" }
   | { name: "goal"; operation: "show" | "clear" }
-  | { name: "goal"; operation: "set"; text: string };
+  | { name: "goal"; operation: "set"; text: string }
+  | { name: "mode"; mode: "hunt" | "game" | "show" };
 
 export type ParsedChatCommand =
   | { kind: "chat" }
@@ -42,7 +43,12 @@ export function parseChatCommand(username: string, message: string, whitelist: r
       }
       return { kind: "invalid", message: "Usage: !goal set <text> | !goal clear | !goal show" };
     }
+    case "mode": {
+      const mode = (args[0]?.toLowerCase() ?? "show") as "hunt" | "game" | "show";
+      if (args.length <= 1 && ["hunt", "game", "show"].includes(mode)) return { kind: "command", command: { name: "mode", mode } };
+      return { kind: "invalid", message: "Usage: !mode hunt | !mode game | !mode" };
+    }
     default:
-      return { kind: "invalid", message: "Commands: !status, !come, !stay, !resume, !goal, !inventory" };
+      return { kind: "invalid", message: "Commands: !status, !come, !stay, !resume, !goal, !inventory, !mode" };
   }
 }

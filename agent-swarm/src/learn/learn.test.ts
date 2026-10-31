@@ -65,7 +65,7 @@ test("Q-learning prefers the tactic that pays off", () => {
     const reward = tactic === "crit" ? 2 : tactic === "retreat" ? -1 : 0.3;
     learner.update(s, tactic, reward, s, options);
   }
-  const best = options.reduce((a, b) => (learner.q(stateKey(s), b) > learner.q(stateKey(s), a) ? b : a));
+  const best = options.reduce((a, b) => (learner.q(s, b) > learner.q(s, a) ? b : a));
   assert.equal(best, "crit");
   assert.ok(learner.stateEpsilon(stateKey(s)) < 0.1, "a well-visited state mostly exploits");
   const rare: CombatState = { ...s, dist: 30 };
@@ -78,4 +78,42 @@ test("pearl tactics are only offered with pearls and at sensible ranges", () => 
   assert.ok(!availableTactics(far, 0, true).includes("pearl_close"));
   const hurt: CombatState = { dist: 3, hp: 5, targetShielding: false, dy: 0, alliesNearTarget: 0 };
   assert.ok(availableTactics(hurt, 4, true).includes("pearl_escape"));
+});
+
+test("v2 generalizes: 'rush beats pearling when he is busy fighting' learned at one range applies at another", () => {
+  const learner = new CombatLearner("gen", tmp());
+  let seed = 7;
+  const rand = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+  const busy = (dist: number): CombatState => ({ dist, hp: 20, targetShielding: false, dy: 0, alliesNearTarget: 2, targetMotion: "still", targetBusy: true });
+  const fleeing = (dist: number): CombatState => ({ dist, hp: 20, targetShielding: false, dy: 0, alliesNearTarget: 0, targetMotion: "fleeing", targetBusy: false });
+  // Training only at 10 blocks: when busy, running in pays; when he flees, the pearl pays.
+  for (let i = 0; i < 600; i++) {
+    const s = i % 2 ? busy(10) : fleeing(10);
+    const opts = availableTactics(s, 16, true);
+    const { tactic } = learner.choose(s, opts, rand);
+    const good = s.targetBusy ? tactic === "rush" : tactic === "pearl_close";
+    learner.update(s, tactic, good ? 2 : tactic.startsWith("pearl") || tactic === "rush" ? -0.5 : 0, null, []);
+  }
+  // Tested at 20 blocks, a distance bucket never trained on.
+  assert.ok(learner.q(busy(20), "rush") > learner.q(busy(20), "pearl_close"), "busy target: rush in");
+  assert.ok(learner.q(fleeing(20), "pearl_close") > learner.q(fleeing(20), "rush"), "fleeing target: pearl");
+});
+
+test("defend is only offered with a mob on the bot", () => {
+  const s: CombatState = { dist: 5, hp: 20, targetShielding: false, dy: 0, alliesNearTarget: 0 };
+  assert.ok(!availableTactics(s, 0, true).includes("defend"));
+  assert.ok(availableTactics({ ...s, mobAdjacent: true }, 0, true).includes("defend"));
+});
+
+test("backup is offered only when a teammate called for help, and old weights survive a new feature", () => {
+  const s: CombatState = { dist: 5, hp: 20, targetShielding: false, dy: 0, alliesNearTarget: 0 };
+  assert.ok(!availableTactics(s, 0, true).includes("backup"));
+  assert.ok(availableTactics({ ...s, allyHurt: true }, 0, true).includes("backup"));
+  const dir = tmp();
+  fs.writeFileSync(
+    path.join(dir, "combat-v2-old.json"),
+    JSON.stringify({ version: 2, w: { rush: new Array(21).fill(0.5) }, visits: {}, updates: 10, curve: [], pending: [], tacticStats: {}, kills: 0, deaths: 0 }),
+  );
+  const learner = new CombatLearner("old", dir);
+  assert.equal(learner.q(s, "rush"), 0.5 * 6, "21 learned weights kept (6 active features here), new one starts at 0");
 });

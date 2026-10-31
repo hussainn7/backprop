@@ -373,13 +373,18 @@ init();
     var el = document.getElementById('learnBody'); if (!el) return;
     var L; try { L = await (await fetch('/api/learning')).json(); } catch (e) { el.textContent = 'learning endpoint unreachable'; return; }
     var c = L.combat, p = L.pearl, h = [];
-    h.push('<h2>LEARNING · COMBAT (Q-learning, squad ' + esc(L.squad) + ')</h2>');
+    h.push('<h2>LEARNING · COMBAT (' + esc(c.model || 'Q-learning') + ', squad ' + esc(L.squad) + ')</h2>');
     h.push('<div>' + c.updates + ' updates · ε ' + c.epsilon.toFixed(3) + ' · ' + c.statesVisited + ' states seen · kills ' + c.kills + ' · deaths ' + c.deaths + '</div>');
     h.push('<div style="color:#888;margin-top:4px">mean reward per 25 decisions (higher = fighting better)</div>' + spark(c.curve, '#5fd38d'));
     h.push('<table><tr><th>tactic</th><th>uses</th><th>hits/use</th><th>reward</th></tr>');
     c.tactics.forEach(function (t) { h.push('<tr title="' + esc(t.info) + '"><td>' + esc(t.name) + '</td><td>' + t.uses + '</td><td>' + t.hitsPerUse.toFixed(2) + '</td><td>' + t.meanReward.toFixed(2) + '</td></tr>'); });
-    h.push('</table><div style="color:#888;margin-top:6px">learned policy (healthy, level ground)</div><table><tr><th>distance</th><th>tactic</th><th>Q</th></tr>');
-    c.policy.forEach(function (r) { h.push('<tr><td>' + esc(r.dist) + '</td><td>' + esc(r.tactic || '—') + '</td><td>' + (r.q === null ? '' : r.q.toFixed(2)) + '</td></tr>'); });
+    h.push('</table><div style="color:#888;margin-top:6px">learned policy (healthy, level ground): he is fighting a teammate vs running away</div><table><tr><th>distance</th><th>he is fighting</th><th>he is fleeing</th></tr>');
+    var rows = {};
+    c.policy.forEach(function (r) { (rows[r.dist] = rows[r.dist] || {})[r.situation || 'any'] = r; });
+    Object.keys(rows).forEach(function (d) {
+      var f = rows[d].fighting || rows[d].any || {}, g = rows[d].fleeing || {};
+      h.push('<tr><td>' + esc(d) + '</td><td>' + esc(f.tactic || '—') + '</td><td>' + esc(g.tactic || '—') + '</td></tr>');
+    });
     h.push('</table><h2>LEARNING · PEARL AIM (physics + RLS)</h2>');
     h.push('<div>' + p.throws + ' throws (' + (p.blocked || 0) + ' blocked mid-air) · ' + p.samples + ' training samples · mean miss first 10: ' + (p.meanErrFirst10 === null ? '—' : p.meanErrFirst10.toFixed(2) + ' b') + ' → last 10: ' + (p.meanErrLast10 === null ? '—' : p.meanErrLast10.toFixed(2) + ' b') + '</div>');
     h.push('<div style="color:#888;margin-top:4px">landing error per throw, blocks (lower = better aim)</div>' + spark(p.errors, '#e94560'));

@@ -37,8 +37,9 @@ import { recordDeath, startScoreboard } from "./scoreboard.js";
 import { createFallTracker, isFallDeath } from "./fall-tracker.js";
 import { shouldFleeOnRespawn } from "./respawn-safety.js";
 import { isHostile } from "./perception.js";
-import { ALL_BOT_NAMES, huntPlayer, registerSquadBot } from "./squad.js";
+import { ALL_BOT_NAMES, huntPlayer, isLeader, registerSquadBot } from "./squad.js";
 import { startArmorKeeper, startHunter, startPearlTopup, startShieldKeeper } from "./hunter.js";
+import { currentMode, setMode } from "./hunt-mode.js";
 
 // Re-export types used by src/index.ts
 export type { ChatMessage, BrainEvents as BotEvents };
@@ -580,6 +581,9 @@ export async function createBot(events: BrainEvents, roleConfig: BotRoleConfig =
           bot.pathfinder.setGoal(null); // synchronous reset; stop() only raises a flag that kills the NEXT walk
           bot.clearControlStates();
         },
+        getMode: currentMode,
+        setMode,
+        announce: isLeader(bot.username),
         goToPlayer: async (playerName) => {
           const player = bot.players[playerName]?.entity;
           if (!player) throw new Error("player is not visible");

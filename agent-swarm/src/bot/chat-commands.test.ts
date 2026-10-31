@@ -62,3 +62,10 @@ test("command arguments pass through the existing viewer safety filter", () => {
     assert.equal(parseChatCommand("Owner", `!goal set ${text}`, players).kind, "invalid");
   }
 });
+
+test("!mode switches hunt/game for whitelisted players only", () => {
+  assert.deepEqual(parseChatCommand("SirFinnn", "!mode hunt", ["SirFinnn"]), { kind: "command", command: { name: "mode", mode: "hunt" } });
+  assert.deepEqual(parseChatCommand("SirFinnn", "!mode", ["SirFinnn"]), { kind: "command", command: { name: "mode", mode: "show" } });
+  assert.equal(parseChatCommand("SirFinnn", "!mode chaos", ["SirFinnn"]).kind, "invalid");
+  assert.equal(parseChatCommand("Stranger", "!mode game", ["SirFinnn"]).kind, "denied");
+});

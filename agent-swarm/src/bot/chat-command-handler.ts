@@ -27,6 +27,10 @@ export interface CommandContext {
   abortActiveSkill(): void;
   stopMovement(): void;
   goToPlayer(username: string): Promise<void>;
+  /** Hunt/game mode switch (shared by every bot); only the announcer replies. */
+  getMode?(): string;
+  setMode?(mode: "hunt" | "game", by: string): void;
+  announce?: boolean;
 }
 
 function sendInventory(bot: CommandBot, items: string[]): void {
@@ -95,6 +99,19 @@ export async function executeChatCommand(
       sendInventory(bot, contents);
       return;
     }
+    case "mode":
+      if (command.mode !== "show") context.setMode?.(command.mode, username);
+      if (context.announce) {
+        const mode = context.getMode?.() ?? "?";
+        bot.chat(
+          mode === "hunt"
+            ? "Mode: HUNT. Every bot commits to the kill while you are in survival."
+            : mode === "game"
+              ? "Mode: GAME. Back to beating the game."
+              : `Mode: ${mode}`,
+        );
+      }
+      return;
     case "goal":
       if (command.operation === "set") {
         memory.setSeasonGoal(command.text);
