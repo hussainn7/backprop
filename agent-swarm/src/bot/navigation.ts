@@ -7,6 +7,93 @@ import { chooseDrownEscape } from "./drown-escape.js";
 import { archetypeOf } from "./squad.js";
 const { goals, Movements } = pkg;
 
+// ── Block lookup cache for A* ───────────────────────────────────────────────
+// Movements.getBlock builds a fresh prismarine Block (and Biome) for every
+// neighbour probe, and A* probes the same few thousand positions over and over:
+// 58% of a five-bot process's CPU was inside getNeighbors, mostly constructing
+// blocks, and it showed up as 100-800 ms event-loop stalls. The decorated
+// result depends only on the absolute position and on this Movements instance's
+// own block sets (avoid lists differ between safe/explorer/base moves), so cache
+// it per instance; drop an entry on blockUpdate, everything on chunk (un)load,
+// and all of it every 5 s.
+const BLOCK_CACHE_MS = 5_000;
+const BLOCK_CACHE_MAX = 250_000;
+type CachedBlocks = { map: Map<string, unknown>; at: number; usedAt: number };
+const botBlockCaches = new WeakMap<Bot, Set<CachedBlocks>>();
+
+function cachesOf(bot: Bot): Set<CachedBlocks> {
+  let set = botBlockCaches.get(bot);
+  if (!set) {
+    const caches = new Set<CachedBlocks>();
+    set = caches;
+    botBlockCaches.set(bot, caches);
+    // Movements are created per navigation; forget ones unused for 30 s.
+    const sweep = () => {
+      for (const c of caches) if (Date.now() - c.usedAt > 30_000) caches.delete(c);
+    };
+    bot.on("blockUpdate", (_old: unknown, block: { position?: Vec3 } | null) => {
+      const p = block?.position;
+      if (!p) return;
+      const key = `${p.x},${p.y},${p.z}`;
+      for (const c of caches) c.map.delete(key);
+    });
+    const clearAll = () => {
+      sweep();
+      for (const c of caches) c.map.clear();
+    };
+    bot.on("chunkColumnLoad", clearAll);
+    bot.on("chunkColumnUnload", clearAll);
+    bot.on("respawn", clearAll);
+  }
+  return set;
+}
+
+function blockCacheFor(moves: { bot: Bot; __blockCache?: CachedBlocks }): CachedBlocks {
+  let c = moves.__blockCache;
+  const now = Date.now();
+  if (!c) {
+    c = { map: new Map(), at: now, usedAt: now };
+    moves.__blockCache = c;
+    cachesOf(moves.bot).add(c);
+  }
+  c.usedAt = now;
+  if (now - c.at > BLOCK_CACHE_MS || c.map.size > BLOCK_CACHE_MAX) {
+    c.map.clear();
+    c.at = now;
+    cachesOf(moves.bot).add(c); // re-register if a sweep dropped it
+  }
+  return c;
+}
+
+{
+  const proto = Movements.prototype as unknown as {
+    getBlock: (
+      this: { bot: Bot; __blockCache?: CachedBlocks },
+      pos: Vec3 | null,
+      dx: number,
+      dy: number,
+      dz: number,
+    ) => unknown;
+    __cachedGetBlock?: boolean;
+  };
+  if (!proto.__cachedGetBlock) {
+    const uncached = proto.getBlock;
+    proto.getBlock = function (pos, dx, dy, dz) {
+      if (!pos) return uncached.call(this, pos, dx, dy, dz);
+      const key = `${pos.x + dx},${pos.y + dy},${pos.z + dz}`;
+      const cache = blockCacheFor(this);
+      let b = cache.map.get(key);
+      if (b === undefined) {
+        b = uncached.call(this, pos, dx, dy, dz);
+        // Unloaded chunks yield a placeholder; don't pin it once the chunk arrives.
+        if ((b as { position?: unknown }).position) cache.map.set(key, b);
+      }
+      return b;
+    };
+    proto.__cachedGetBlock = true;
+  }
+}
+
 /**
  * GoalNearXZ that also demands the arrival be at or above `minY`.
  *
