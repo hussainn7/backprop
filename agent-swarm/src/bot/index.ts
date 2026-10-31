@@ -38,7 +38,7 @@ import { createFallTracker, isFallDeath } from "./fall-tracker.js";
 import { shouldFleeOnRespawn } from "./respawn-safety.js";
 import { isHostile } from "./perception.js";
 import { ALL_BOT_NAMES, huntPlayer, registerSquadBot } from "./squad.js";
-import { startArmorKeeper, startHunter, startShieldKeeper } from "./hunter.js";
+import { startArmorKeeper, startHunter, startPearlTopup, startShieldKeeper } from "./hunter.js";
 
 // Re-export types used by src/index.ts
 export type { ChatMessage, BrainEvents as BotEvents };
@@ -433,6 +433,7 @@ export async function createBot(events: BrainEvents, roleConfig: BotRoleConfig =
   bot.once("spawn", () => {
     startShieldKeeper(bot);
     startArmorKeeper();
+    startPearlTopup(BOT_ROSTER.map((r) => r.username));
     startHunter(bot, brain);
   });
 

@@ -86,6 +86,9 @@ and every decision (state, tactic, explored?, reward, hits, damage) is appended 
    A throw whose hindsight label is implausible (more than 8° from physics) stopped on a
    tree or wall mid-flight; it is recorded as *blocked* and never trained on.
 
+With `PEARL_TOPUP=true` the agents process refills each bot to 16 pearls (via local RCON)
+whenever it is down to 4, so pearl tactics and the aim model keep getting data.
+
 Every throw's landing error is stored (`pearl-aim-<squad>.json`). The unit test simulates
 a server whose pearls fly 3° low: the first throw misses by over a block, and within a
 few throws the model has learned the bias and the misses drop below 0.3 blocks.

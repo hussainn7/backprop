@@ -113,6 +113,41 @@ export function startArmorKeeper(): void {
   setInterval(() => void apply(), 20_000).unref();
 }
 
+// ── Pearl top-up (PEARL_TOPUP=true) ─────────────────────────────────────────
+// Pearl tactics and the aim model learn only while there are pearls to throw.
+// Every 20 s, refill this squad's bots (never human players) back to 16 when
+// they are down to 4 or fewer. `clear <bot> ender_pearl 0` counts without
+// removing anything. Each squad process refills only its own five bots.
+let pearlTopupStarted = false;
+
+export function startPearlTopup(botNames: string[]): void {
+  if (pearlTopupStarted || process.env.PEARL_TOPUP !== "true") return;
+  pearlTopupStarted = true;
+  const settings = rconSettings();
+  if (!settings) {
+    console.warn("[Pearls] no RCON settings in server/server.properties — cannot top up pearls");
+    return;
+  }
+  const { Rcon } = createRequire(import.meta.url)("rcon-client");
+  const refill = async () => {
+    try {
+      const rcon = await Rcon.connect({ host: "127.0.0.1", port: settings.port, password: settings.password, timeout: 3000 });
+      for (const name of botNames) {
+        const reply: string = await rcon.send(`clear ${name} minecraft:ender_pearl 0`);
+        const have = Number(reply.match(/Found (\d+) matching item/)?.[1] ?? (/No items were found/.test(reply) ? 0 : NaN));
+        if (Number.isNaN(have) || have > 4) continue; // offline, or plenty left
+        await rcon.send(`give ${name} minecraft:ender_pearl ${16 - have}`);
+        console.log(`[Pearls] topped up ${name}: ${have} -> 16`);
+      }
+      await rcon.end();
+    } catch (err) {
+      console.warn(`[Pearls] top-up pass failed: ${(err as Error).message}`);
+    }
+  };
+  void refill();
+  setInterval(() => void refill(), 20_000).unref();
+}
+
 const sameDimension = (a: string, b: string | undefined) =>
   a.replace(/^minecraft:/, "") === String(b ?? "").replace(/^minecraft:/, "");
 
