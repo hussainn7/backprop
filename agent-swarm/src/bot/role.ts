@@ -1,3 +1,4 @@
+import "dotenv/config"; // BASE_POS etc. are read at module load
 /**
  * Static role definitions for every bot in the swarm.
  *
@@ -74,11 +75,35 @@ export interface BotRoleConfig {
 }
 
 /**
+ * Endgame kit every bot carries regardless of role, so deposit_stash never
+ * banks it (2026-10-31: three bots stashed all 16 eyes of ender and their
+ * golden carrots minutes after receiving them for the stronghold mission).
+ */
+const ENDGAME_KEEP = [
+  { name: "ender_eye", minCount: 16 },
+  { name: "ender_pearl", minCount: 16 },
+  { name: "golden_carrot", minCount: 64 },
+  { name: "enchanted_golden_apple", minCount: 4 },
+  { name: "golden_apple", minCount: 16 },
+  { name: "arrow", minCount: 64 },
+  { name: "shield", minCount: 1 },
+  { name: "water_bucket", minCount: 1 },
+  { name: "netherite_", minCount: 9 },
+];
+
+/**
  * Shared stash position — a few blocks from the team safeSpawn so every bot
  * agrees where "The Stash" is. setup_stash ground-snaps the Y at runtime,
  * so this Y only needs to be close enough for pathfinding.
  */
-export const STASH_POS = { x: 286, y: 70, z: -314 };
+// BASE_POS / FARM_POS ("x,y,z") override upstream's coordinates, which belong to
+// the original developer's world and are meaningless on any other seed.
+function posFromEnv(name: string, fallback: { x: number; y: number; z: number }) {
+  const parts = (process.env[name] || "").split(",").map((n) => Number(n.trim()));
+  return parts.length === 3 && parts.every(Number.isFinite) ? { x: parts[0], y: parts[1], z: parts[2] } : fallback;
+}
+
+export const STASH_POS = posFromEnv("BASE_POS", { x: 286, y: 70, z: -314 });
 
 /**
  * The farm site — the open waterline BELOW the village where build_farm's
@@ -89,10 +114,10 @@ export const STASH_POS = { x: 286, y: 70, z: -314 };
  * died at "Couldn't reach the farm site" while the real field sat 15 blocks
  * away.
  */
-export const FARM_SITE = { x: 302, y: 58, z: -307 };
+export const FARM_SITE = posFromEnv("FARM_POS", { x: 302, y: 58, z: -307 });
 
 /** Renewable tree farm east of the village (saplings + torches, RCON-provisioned). */
-export const TREE_FARM = { x: 306, y: 71, z: -316 };
+export const TREE_FARM = posFromEnv("TREE_FARM_POS", { x: 306, y: 71, z: -316 });
 
 /** Atlas: Explorer and miner. Roams widely, finds ores, scouts terrain. */
 export const ATLAS_CONFIG: BotRoleConfig = {
@@ -107,7 +132,7 @@ export const ATLAS_CONFIG: BotRoleConfig = {
   stashPos: STASH_POS,
   // Moved east to fresh forested territory — the X=30 area was fully stripped by previous sessions.
   // Ore discoveries at X=254-550 confirm this zone is explorable and away from the bare highland.
-  safeSpawn: { x: 280, y: 0, z: -320 },
+  safeSpawn: { x: STASH_POS.x, y: 0, z: STASH_POS.z },
   allowedActions: ["explore", "go_to", "gather_wood", "mine_block", "chat", "eat", "sleep", "flee", "attack"],
   // find_fortress left this list on 2026-09-23: Atlas ran it four times in
   // one hour through the model, drew a crossbow and 24 arrows from the
@@ -116,6 +141,7 @@ export const ATLAS_CONFIG: BotRoleConfig = {
   // wood_run (2026-09-25): the explorer fetches wood from standing trees in sight.
   allowedSkills: ["craft_gear", "go_fishing", "wood_run"],
   keepItems: [
+    ...ENDGAME_KEEP,
     { name: "_log", minCount: 3 },
     { name: "stick", minCount: 4 },
     { name: "pickaxe", minCount: 1 },
@@ -148,8 +174,8 @@ export const FLORA_CONFIG: BotRoleConfig = {
   leashRadius: 150,
   stashPos: STASH_POS,
   // Matches Atlas safeSpawn — moved east to fresh territory away from the stripped X=30 zone
-  safeSpawn: { x: 280, y: 0, z: -320 },
-  allowedActions: ["craft", "eat", "sleep", "go_to", "place_block", "chat", "flee"],
+  safeSpawn: { x: STASH_POS.x, y: 0, z: STASH_POS.z },
+  allowedActions: ["craft", "eat", "sleep", "go_to", "place_block", "chat", "flee", "attack"],
   // build_nether_portal doubles as the ride home for anyone who stumbles
   // through the village doorway — Flora took the trip within an hour of
   // ignition and had no way back.
@@ -164,6 +190,7 @@ export const FLORA_CONFIG: BotRoleConfig = {
     "bucket_fish",
   ],
   keepItems: [
+    ...ENDGAME_KEEP,
     { name: "_log", minCount: 3 },
     { name: "stick", minCount: 4 },
     { name: "pickaxe", minCount: 1 },
@@ -197,7 +224,7 @@ export const FORGE_CONFIG: BotRoleConfig = {
   personality: `You are Forge, a gruff dwarf-like miner who talks to rocks and ore veins like old friends. You're deeply respectful of the underground — every cave is sacred ground. You judge surface-dwellers for wasting daylight. The sound of pickaxes is your favorite music.`,
   leashRadius: 250,
   stashPos: STASH_POS,
-  safeSpawn: { x: 280, y: 0, z: -320 },
+  safeSpawn: { x: STASH_POS.x, y: 0, z: STASH_POS.z },
   // Run 677: Forge died six times in an hour to creepers, skeletons, a spider
   // and an enderman with a stone sword in his pack and no way to swing it;
   // the miner could only flee, and in a cave that means into the mob. The
@@ -224,6 +251,7 @@ export const FORGE_CONFIG: BotRoleConfig = {
     "bucket_fish",
   ],
   keepItems: [
+    ...ENDGAME_KEEP,
     { name: "_log", minCount: 3 },
     { name: "stick", minCount: 4 },
     { name: "fishing_rod", minCount: 1 },
@@ -260,7 +288,7 @@ export const MASON_CONFIG: BotRoleConfig = {
   personality: `You are Mason, a meticulous architect who critiques every structure for symmetry and proportion. You measure twice and place once. Asymmetry genuinely upsets you. Your dream is to build a cathedral worthy of the server. You compliment teammates who bring you good building materials.`,
   leashRadius: 150,
   stashPos: STASH_POS,
-  safeSpawn: { x: 280, y: 0, z: -320 },
+  safeSpawn: { x: STASH_POS.x, y: 0, z: STASH_POS.z },
   // mine_block + the mining skills arrived with the ore-hauler trade: the
   // first specialist hour handed Mason a mission the action gate would not
   // let him execute — no strip_mine, no craft_gear, not even mine_block.
@@ -315,6 +343,7 @@ export const MASON_CONFIG: BotRoleConfig = {
     "bucket_fish",
   ],
   keepItems: [
+    ...ENDGAME_KEEP,
     { name: "_log", minCount: 3 },
     { name: "stick", minCount: 4 },
     { name: "fishing_rod", minCount: 1 },
@@ -360,7 +389,7 @@ export const BLADE_CONFIG: BotRoleConfig = {
   personality: `You are Blade, a stoic warrior who speaks in short, direct sentences. You constantly scan for threats. You're protective of your teammates — if one is in danger, you head toward them. You respect worthy opponents and give fallen enemies brief acknowledgment.`,
   leashRadius: 300,
   stashPos: STASH_POS,
-  safeSpawn: { x: 280, y: 0, z: -320 },
+  safeSpawn: { x: STASH_POS.x, y: 0, z: STASH_POS.z },
   // gather_wood joined the hunter's kit when he turned out to be the only
   // bot carrying saplings — the replanting branch lives inside gather_wood,
   // and the one bot who could reforest was the one bot barred from trying.
@@ -370,6 +399,7 @@ export const BLADE_CONFIG: BotRoleConfig = {
   // the standing raw-metal-aboard override cooks whatever oh_shiny withdraws.
   allowedSkills: ["neural_combat", "craft_gear", "build_nether_portal", "smelt_ores", "go_fishing"],
   keepItems: [
+    ...ENDGAME_KEEP,
     { name: "_log", minCount: 3 },
     { name: "stick", minCount: 4 },
     { name: "pickaxe", minCount: 1 },

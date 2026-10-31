@@ -273,3 +273,4 @@
 {"ts":"2026-10-31T14:07:07-04:00","by":"SirFinnn (creative)","type":"item_grant","detail":"Atlas received iron helmet/chestplate/leggings (equipped 14:07:07) - taints story/obtain_armor"}
 {"ts":"2026-10-31T14:32:20-04:00","by":"SirFinnn (in-game, op)","type":"teleport","detail":"tp Atlas, Blade, Flora, Mason to SirFinnn"}
 {"ts":"2026-10-31T14:33:05-04:00","by":"SirFinnn (in-game, op)","type":"world","detail":"/setworldspawn then /kill @a (all bots respawn at new spawn; resets time_since_death)"}
+{"ts":"2026-10-31T15:14:06-04:00","by":"SirFinnn (owner request)","type":"item_grant","detail":"max kit to all 5 bots: full enchanted netherite armor+tools, Power V bow+arrows, shield, 64 golden carrots, 16 golden + 4 enchanted golden apples, 16 ender pearls, 16 eyes of ender, water bucket, blocks, torches. Milestones 4-9 no longer prove earned progress."}

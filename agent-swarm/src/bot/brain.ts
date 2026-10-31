@@ -713,7 +713,7 @@ export class BotBrain {
         inventory: this.bot.inventory.items().map((i) => `${i.name}x${i.count}`),
         // Role mission outranks broadcast steering: specialists hold their
         // lane even when a chat-set goal sweeps the team.
-        seasonGoal: this.roleConfig.seasonGoal ?? this.memStore.getSeasonGoal() ?? undefined,
+        seasonGoal: process.env.TEAM_GOAL || this.roleConfig.seasonGoal || this.memStore.getSeasonGoal() || undefined,
       };
       if (isSkillRunning(this.bot)) {
         overlayData.action = `[SKILL] ${getActiveSkillName(this.bot)}`;
@@ -923,6 +923,50 @@ export class BotBrain {
     });
   }
 
+  /**
+   * Shed junk when the inventory is nearly full, so loot and handed items fit.
+   * 2026-10-31: Atlas sat at 40/41 slots (320 cobblestone, andesite, dirt,
+   * gravel, outgrown gear) and an entire item grant fell on the ground.
+   */
+  private async shedJunk(): Promise<void> {
+    const items = this.bot.inventory.items();
+    if (items.length < 30) return;
+    const BUILD = new Set(["cobblestone", "cobbled_deepslate", "dirt", "netherrack", "blackstone"]);
+    const ALWAYS = new Set([
+      "andesite", "diorite", "granite", "tuff", "gravel", "sand", "calcite", "stone", "deepslate",
+      "rotten_flesh", "poisonous_potato", "snowball", "clay_ball", "dead_bush", "pointed_dripstone",
+    ]);
+    const TIERS = ["wooden", "stone", "golden", "iron", "diamond", "netherite"];
+    const tierOf = (n: string) => TIERS.findIndex((t) => n.startsWith(`${t}_`) || (t === "golden" && n.startsWith("gold")));
+    const best = new Map<string, number>(); // kind ("pickaxe", "helmet"...) -> best tier held/worn
+    const worn = [5, 6, 7, 8].map((i) => this.bot.inventory.slots[i]).filter(Boolean);
+    for (const it of [...items, ...worn]) {
+      const kind = it!.name.split("_").pop()!;
+      const t = it!.name.startsWith("leather_") ? 0 : tierOf(it!.name);
+      if (t >= 0) best.set(kind, Math.max(best.get(kind) ?? -1, t));
+    }
+    let keptBuild = 0;
+    const tossed: string[] = [];
+    for (const it of items.sort((a, b) => b.count - a.count)) {
+      const kind = it.name.split("_").pop()!;
+      const t = it.name.startsWith("leather_") ? 0 : tierOf(it.name);
+      let drop = 0;
+      if (ALWAYS.has(it.name)) drop = it.count;
+      else if (BUILD.has(it.name)) {
+        const keep = Math.max(0, 64 - keptBuild);
+        keptBuild += Math.min(it.count, keep);
+        drop = it.count - Math.min(it.count, keep);
+      } else if (t >= 0 && /(pickaxe|axe|shovel|hoe|sword|helmet|chestplate|leggings|boots)$/.test(it.name) && t < (best.get(kind) ?? -1)) {
+        drop = it.count;
+      }
+      if (drop > 0) {
+        await this.bot.toss(it.type, null, drop).catch(() => {});
+        tossed.push(`${drop} ${it.name}`);
+      }
+    }
+    if (tossed.length) this.log.info("Brain", `Shed junk (${items.length} slots): ${tossed.join(", ")}`);
+  }
+
   /** Weapons the bot carries (swords/axes), best first by name tier. */
   private carriedWeapon(): string | null {
     const order = ["netherite", "diamond", "iron", "stone", "golden", "wooden"];
@@ -958,6 +1002,12 @@ export class BotBrain {
     }
     if (hp <= 5 && dist < 8 && usable("flee")) {
       return { thought: `Only ${hp.toFixed(0)} HP with a ${name} close — getting out.`, action: "flee", params: {} };
+    }
+    // Drowned throw tridents from the water at night (13 of 13 deaths after the
+    // first reflex deploy were drowned, mostly "impaled"). Out of sword reach
+    // and hurt: get away from the shoreline instead of trading at range.
+    if (name === "drowned" && dist >= 6 && hp < 14 && usable("flee")) {
+      return { thought: `Drowned throwing tridents from ${dist.toFixed(0)} blocks — moving away from the water.`, action: "flee", params: {} };
     }
     if (weapon && usable("attack")) {
       if (MELEE.has(name) && dist < 6 && hp >= 8) {
@@ -1396,6 +1446,8 @@ export class BotBrain {
     const now = Date.now();
     if (now - this.lastStrategicMs < this.STRATEGIC_COOLDOWN_MS) return;
     this.lastStrategicMs = now;
+
+    if (!isSkillRunning(this.bot)) await this.shedJunk();
 
     // Safety overrides first
     if (await this.runSafetyOverrides()) return;
@@ -4509,7 +4561,7 @@ export class BotBrain {
       name: this.roleConfig.name,
       personality: this.roleConfig.personality,
       role: this.roleConfig.role,
-      seasonGoal: this.roleConfig.seasonGoal ?? this.memStore.getSeasonGoal(),
+      seasonGoal: process.env.TEAM_GOAL || this.roleConfig.seasonGoal || this.memStore.getSeasonGoal(),
       allowedActions: menu.length ? menu : this.roleConfig.allowedActions,
       eatBlocked: this.recentFailures.has("eat"),
       allowedSkills: this.roleConfig.allowedSkills,
