@@ -16,6 +16,7 @@ import { abortActiveSkill, getActiveSkillName } from "../skills/executor.js";
 import { registerBotMemory } from "./memory-registry.js";
 import { PlanStore } from "../plan/state.js";
 import { registerBotPlan } from "../plan/registry.js";
+import { getTeamStatus } from "./bulletin.js";
 import { skillRegistry } from "../skills/registry.js";
 import { BotMemoryStore } from "./memory.js";
 import { BotRoleConfig, ATLAS_CONFIG } from "./role.js";
@@ -71,7 +72,14 @@ const stallRelogAt = new Map<string, number>();
 
 export async function createBot(events: BrainEvents, roleConfig: BotRoleConfig = ATLAS_CONFIG) {
   if (installPhysicsEpsilon()) console.log("[Physics] collision epsilon installed (1e-7)");
-  startScoreboard();
+  // Scoreboard samples the bulletin once a minute for duplicate-medium
+  // tracking. Importing bulletin here (rather than inside scoreboard) keeps
+  // scoreboard a leaf module — bulletin → scoreboard is a one-way edge.
+  startScoreboard(() => {
+    const out: Record<string, string | undefined> = {};
+    for (const s of getTeamStatus("")) out[s.name] = s.mediumGoal;
+    return out;
+  });
   ensureNeuralServer().catch((e) => console.warn("[Bot] Neural spawn error:", e));
 
   // One row per swarm start. Cheap, and it is the only record of whether any

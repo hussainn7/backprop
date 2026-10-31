@@ -8,6 +8,7 @@ import type { Bot } from "mineflayer";
 import { MEDIUM_SPECS, snapshotBot, type BotSnapshot } from "./hierarchy.js";
 import { nextStep } from "./compile.js";
 import { getBotPlan } from "./registry.js";
+import { recordPlanMilestone } from "../bot/scoreboard.js";
 
 export interface PlanLineOpts {
   earnedAdvancements?: Set<string>;
@@ -23,11 +24,13 @@ export function getPlanLine(bot: Bot, opts: PlanLineOpts = {}): string {
   if (!store) return "";
   const snap = snapshotBot(bot, opts);
 
-  // Did whatever medium we were on just complete? If so record it and
-  // clear active; the next pickMedium call will choose the next one.
+  // Did whatever medium we were on just complete? If so record it in both
+  // the per-bot plan ledger (persisted) and the shared session scoreboard
+  // (so the benchmark report shows one unified timeline across the swarm).
   const wasActive = store.snapshot().activeMedium;
   if (store.tryCompleteActive(snap)) {
     console.log(`[Plan] ${bot.username ?? "?"} completed medium "${wasActive}"`);
+    if (wasActive) recordPlanMilestone(wasActive, bot.username ?? "?");
   }
 
   // Choose or re-choose the active medium. The chain order means the first

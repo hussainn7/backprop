@@ -12,6 +12,7 @@
 import fs from "fs";
 import path from "path";
 import type { Bot } from "mineflayer";
+import { getLedger } from "../llm/budget.js";
 
 interface BotStats {
   actions: number;
@@ -24,20 +25,38 @@ interface BotStats {
   skillFailures: number;
 }
 
-interface Milestone {
+export interface Milestone {
   name: string;
   bot: string;
   /** Seconds since session start */
   atSec: number;
+  /** Session-lifetime cost in USD at the moment this milestone was observed.
+   *  Snapshot once, never updated — the point is "what did it cost to reach
+   *  this?" and later spending on other milestones must not inflate it. */
+  costUsdAt?: number;
+  /** Which hierarchy this milestone belongs to. "inventory" entries come
+   *  from first-time inventory scans (first_log, first_iron_tool…);
+   *  "plan" entries come from the hierarchical planner (iron_tier,
+   *  nether_entry, dragon_kill…). The report shows them side by side. */
+  source?: "inventory" | "plan" | "event";
 }
 
-interface SessionStats {
+export interface SessionStats {
   sessionId: string;
   sessionStart: string;
   /** Updated on each save */
   durationSec: number;
   perBot: Record<string, BotStats>;
   milestones: Milestone[];
+  /** Minutes observed where two or more bots held the same mediumGoal in
+   *  the bulletin at the same time. One tick per minute; a single minute
+   *  with three overlapping bots still counts as one. */
+  duplicateMediumMinutes: number;
+  /** Count of distinct minutes sampled, so the duplicate rate is a true
+   *  fraction (duplicateMediumMinutes / minutesSampled). */
+  minutesSampled: number;
+  /** Lifetime cost in USD at the latest save, for the quick dashboard row. */
+  costUsdNow: number;
 }
 
 const SESSION_START = Date.now();
@@ -47,7 +66,23 @@ const stats: SessionStats = {
   durationSec: 0,
   perBot: {},
   milestones: [],
+  duplicateMediumMinutes: 0,
+  minutesSampled: 0,
+  costUsdNow: 0,
 };
+/** Lifetime USD at the moment the session started. Every milestone's cost
+ *  is reported as the delta from this baseline, so a scoreboard reset in a
+ *  long-running budget doesn't carry prior days' spend into the "cost to
+ *  reach first iron" number. */
+const SESSION_COST_BASELINE: number = safeLifetimeCost();
+
+function safeLifetimeCost(): number {
+  try {
+    return getLedger().lifetime.costUsd ?? 0;
+  } catch {
+    return 0;
+  }
+}
 
 const reachedMilestones = new Set<string>();
 let saveTimer: NodeJS.Timeout | null = null;
@@ -85,13 +120,23 @@ const INVENTORY_MILESTONES: { name: string; matches: (itemName: string) => boole
   { name: "first_chest", matches: (n) => n === "chest" },
 ];
 
-function recordMilestone(name: string, bot: string): void {
+function recordMilestone(name: string, bot: string, source: Milestone["source"] = "event"): void {
   if (reachedMilestones.has(name)) return;
   reachedMilestones.add(name);
   const atSec = Math.round((Date.now() - SESSION_START) / 1000);
-  stats.milestones.push({ name, bot, atSec });
-  console.log(`[Scoreboard] 🏆 MILESTONE: ${name} by ${bot} at ${atSec}s`);
+  // Session delta, not absolute lifetime — see SESSION_COST_BASELINE above.
+  const costUsdAt = Math.max(0, safeLifetimeCost() - SESSION_COST_BASELINE);
+  stats.milestones.push({ name, bot, atSec, costUsdAt, source });
+  console.log(`[Scoreboard] 🏆 MILESTONE: ${name} by ${bot} at ${atSec}s ($${costUsdAt.toFixed(4)})`);
   dirty = true;
+}
+
+/** Public hook for the hierarchical planner (src/plan). The planner knows
+ *  when a MediumGoal flipped done and calls here with a stable `name`
+ *  (e.g. "plan_iron_tier"). Keeps plan + inventory milestones in one
+ *  timeline for the benchmark report. */
+export function recordPlanMilestone(mediumGoal: string, bot: string): void {
+  recordMilestone(`plan_${mediumGoal}`, bot, "plan");
 }
 
 /** Call after every executed action. */
@@ -132,7 +177,7 @@ export function checkInventoryMilestones(bot: Bot, botName: string): void {
     const names = bot.inventory.items().map((i) => i.name);
     for (const m of INVENTORY_MILESTONES) {
       if (!reachedMilestones.has(m.name) && names.some(m.matches)) {
-        recordMilestone(m.name, botName);
+        recordMilestone(m.name, botName, "inventory");
       }
     }
   } catch {
@@ -144,6 +189,7 @@ function save(): void {
   if (!dirty) return;
   dirty = false;
   stats.durationSec = Math.round((Date.now() - SESSION_START) / 1000);
+  stats.costUsdNow = Math.max(0, safeLifetimeCost() - SESSION_COST_BASELINE);
   try {
     const dir = path.resolve("logs", "sessions");
     fs.mkdirSync(dir, { recursive: true });
@@ -153,10 +199,41 @@ function save(): void {
   }
 }
 
-/** Start periodic persistence. Idempotent. */
-export function startScoreboard(): void {
+/** Sample the bulletin: for every medium goal held by two or more bots at
+ *  this instant, count the minute as "duplicated". Called from the
+ *  session timer below so there is exactly one dedicated tick per minute
+ *  and the ratio stays interpretable. */
+function sampleDuplicateMediums(mediumsByBot: Record<string, string | undefined>): void {
+  stats.minutesSampled += 1;
+  const counts = new Map<string, number>();
+  for (const m of Object.values(mediumsByBot)) {
+    if (!m) continue;
+    counts.set(m, (counts.get(m) ?? 0) + 1);
+  }
+  for (const n of counts.values()) {
+    if (n >= 2) {
+      stats.duplicateMediumMinutes += 1;
+      break; // one minute is one minute, no matter how many mediums overlap
+    }
+  }
+  dirty = true;
+}
+
+/** Start periodic persistence. Idempotent. Also samples the duplicate-medium
+ *  counter once per minute: the caller provides a sampler because scoreboard
+ *  does not import bulletin (bulletin → scoreboard imports flow one way). */
+export function startScoreboard(sampleMediums?: () => Record<string, string | undefined>): void {
   if (saveTimer) return;
-  saveTimer = setInterval(save, 60_000);
+  saveTimer = setInterval(() => {
+    if (sampleMediums) {
+      try {
+        sampleDuplicateMediums(sampleMediums());
+      } catch (err) {
+        console.warn("[Scoreboard] duplicate sample failed:", err);
+      }
+    }
+    save();
+  }, 60_000);
   saveTimer.unref?.();
   console.log(`[Scoreboard] Session ${stats.sessionId} started`);
 }
