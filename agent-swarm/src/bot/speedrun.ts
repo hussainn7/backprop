@@ -2056,6 +2056,43 @@ async function enterFromFloor(bot: Bot, cell: Vec3): Promise<boolean> {
   return inEnd(bot);
 }
 
+/**
+ * From below the portal (on the room's floor or swimming in the lava pool under it, which fire resistance
+ * allows): line up under its centre and keep jumping/swimming up into it. The portal cells are open air
+ * above the pool, so rising 1-2 blocks puts the bot inside one.
+ */
+async function enterFromBelow(bot: Bot, cell: Vec3): Promise<boolean> {
+  const pid = bot.registry.blocksByName.end_portal?.id;
+  if (pid === undefined) return false;
+  const cells = bot.findBlocks({ matching: pid, maxDistance: 5, count: 12, point: cell });
+  if (!cells.length) return false;
+  const cx = cells.reduce((n, c) => n + c.x, 0) / cells.length + 0.5;
+  const cz = cells.reduce((n, c) => n + c.z, 0) / cells.length + 0.5;
+  doing(bot, "swimming up into the End portal from below");
+  const until = Date.now() + 30_000;
+  bot.pathfinder.setGoal(null);
+  while (!inEnd(bot) && Date.now() < until && bot.entity && currentMode() === "game") {
+    await sleep(10);
+    await guard(bot);
+    const p = bot.entity.position;
+    const off = Math.hypot(p.x - cx, p.z - cz);
+    if (off > 0.45) {
+      await bot.lookAt(new Vec3(cx, p.y + 0.5, cz), true).catch(() => {});
+      bot.setControlState("forward", true);
+      bot.setControlState("jump", true); // swims in lava/water, hops on the floor
+      await sleep(off > 2 ? 200 : 70);
+      bot.setControlState("forward", false);
+      await sleep(40);
+    } else {
+      bot.setControlState("jump", true);
+      await sleep(180);
+    }
+  }
+  bot.clearControlStates();
+  if (!inEnd(bot)) await sleep(1200);
+  return inEnd(bot);
+}
+
 async function jumpIn(bot: Bot): Promise<void> {
   doing(bot, "jumping into the End portal");
   const id = bot.registry.blocksByName.end_portal?.id;
@@ -2093,6 +2130,7 @@ async function jumpIn(bot: Bot): Promise<void> {
   }
   // On the room's floor, below the frames: step up onto a frame (the pathfinder cannot).
   if (bot.entity.position.y < cell.position.y - 0.4 && flat(bot.entity.position, cell.position) < 10) {
+    if (await enterFromBelow(bot, cell.position)) return; // the simple way: straight up from under the portal
     if (await enterFromFloor(bot, cell.position)) return;
   }
   if (await walkInto(bot, cell.position, "end_portal", () => inEnd(bot))) return;
