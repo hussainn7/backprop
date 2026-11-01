@@ -418,19 +418,49 @@ async function march(bot: Bot, target: XYZ | { x: number; z: number }, ms: numbe
 /** Eat when hurt or hungry: golden apples when hurt, beef otherwise. */
 const fireResAt = new Map<string, number>();
 
+/** Lava within a few blocks of the bot (any dimension), including the cell it stands in. */
+function lavaNear(bot: Bot, r = 3): boolean {
+  const p = bot.entity.position.floored();
+  for (let dx = -r; dx <= r; dx++)
+    for (let dz = -r; dz <= r; dz++)
+      for (let dy = -3; dy <= 1; dy++) {
+        const n = bot.blockAt(p.offset(dx, dy, dz))?.name;
+        if (n === "lava") return true;
+      }
+  return false;
+}
+
+function hasFireResistance(bot: Bot): boolean {
+  const id = (bot.registry as unknown as { effectsByName?: Record<string, { id: number }> }).effectsByName?.FireResistance?.id ?? 11;
+  const fx = (bot.entity as unknown as { effects?: Record<number, unknown> }).effects;
+  return !!fx && !!fx[id];
+}
+
+let eating = new Set<string>();
+/** Eat an enchanted golden apple for 5 minutes of fire resistance; true when it was eaten. */
+async function fireResist(bot: Bot, why: string): Promise<boolean> {
+  if (eating.has(bot.username) || !count(bot, "enchanted_golden_apple")) return false;
+  eating.add(bot.username);
+  try {
+    const held = bot.heldItem?.name;
+    if (!(await equip(bot, "enchanted_golden_apple"))) return false;
+    bot.pathfinder.setGoal(null);
+    await Promise.race([bot.consume().catch(() => {}), sleep(3500)]);
+    fireResAt.set(bot.username, Date.now());
+    console.log(`[Speedrun] ${bot.username}: ate an enchanted golden apple for fire resistance (${why}; ${count(bot, "enchanted_golden_apple")} left)`);
+    if (held) await equip(bot, held);
+    return true;
+  } finally {
+    eating.delete(bot.username);
+  }
+}
+
 async function topUp(bot: Bot): Promise<void> {
   if (!bot.entity) return;
   // In the Nether keep Fire Resistance up (an enchanted golden apple gives 5 min of it):
   // falls into the lava sea under the fortress were the main killer.
-  if (inNether(bot) && Date.now() - (fireResAt.get(bot.username) ?? 0) > 270_000 && count(bot, "enchanted_golden_apple")) {
-    const held = bot.heldItem?.name;
-    if (await equip(bot, "enchanted_golden_apple")) {
-      bot.pathfinder.setGoal(null);
-      await Promise.race([bot.consume().catch(() => {}), sleep(4000)]);
-      fireResAt.set(bot.username, Date.now());
-      console.log(`[Speedrun] ${bot.username}: ate an enchanted golden apple for fire resistance (${count(bot, "enchanted_golden_apple")} left)`);
-      if (held) await equip(bot, held);
-    }
+  if (inNether(bot) && !hasFireResistance(bot) && Date.now() - (fireResAt.get(bot.username) ?? 0) > 20_000) {
+    await fireResist(bot, "in the Nether");
   }
   let food: string | null = null;
   if (bot.health <= 8 && count(bot, "enchanted_golden_apple")) food = "enchanted_golden_apple";
@@ -1987,6 +2017,15 @@ async function step(bot: Bot): Promise<void> {
 export function startSpeedrun(bot: Bot, brain: Pausable): void {
   if (process.env.SPEEDRUN_DIRECTOR !== "true") return;
   captureChat(bot);
+  // Lava guard: lava killed bots in overworld caves as well as the Nether. Whenever lava is
+  // within a few blocks and no fire resistance is active, eat for it before stepping closer.
+  const lavaTimer = setInterval(() => {
+    if (!bot.entity || bot.health <= 0 || currentMode() !== "game") return;
+    if (hasFireResistance(bot) || eating.has(bot.username)) return;
+    if (Date.now() - (fireResAt.get(bot.username) ?? 0) < 20_000) return;
+    if (lavaNear(bot)) void fireResist(bot, "lava nearby");
+  }, 400);
+  bot.once("end", () => clearInterval(lavaTimer));
   if (state.endPortal && ["end", "dragon", "done"].includes(state.phase)) shareOpenPortal(state.endPortal);
   void import("../stream/race.js")
     .then(({ startRaceServers }) => startRaceServers(raceSnapshot))

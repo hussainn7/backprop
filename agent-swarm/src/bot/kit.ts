@@ -93,6 +93,15 @@ export function startKitKeeper(squadBots: string[]): void {
           console.log(`[Kit] ${n}: full loadout applied (${hasChest ? "" : "no armor"}${!hasChest && !hasSword ? ", " : ""}${hasSword ? "" : "no sword"})`);
         }
         if (process.env.SPEEDRUN_KIT === "true") {
+          // Fire resistance (5 min per enchanted golden apple) is the lava insurance: never run out.
+          const ap: string = await rcon.send(`clear ${n} minecraft:enchanted_golden_apple 0`);
+          if (!/No player was found|No entity was found/.test(ap)) {
+            const have = Number(ap.match(/Found (\d+)/)?.[1] ?? 0);
+            if (have < 3) {
+              await rcon.send(`give ${n} minecraft:enchanted_golden_apple ${8 - have}`);
+              console.log(`[Kit] ${n}: enchanted golden apples ${have} -> 8`);
+            }
+          }
           const pick: string = await rcon.send(`clear ${n} minecraft:netherite_pickaxe 0`);
           if (!/Found [1-9]\d* matching/.test(pick)) {
             for (const cmd of SPEEDRUN(n)) await rcon.send(cmd);
