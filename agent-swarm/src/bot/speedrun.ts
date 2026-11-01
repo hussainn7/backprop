@@ -37,6 +37,7 @@ import { recordDeath, dimKey } from "./danger.js";
 import { createRequire } from "node:module";
 import { rconSettings } from "./hunter.js";
 import { Swimmer } from "./swim.js";
+import { Coach, type Signals } from "./coach.js";
 import { EscapeLearner, TACTICS, ctxKey, bucketDistance, bucketVertical, type Ctx, type Tactic } from "./escape-learner.js";
 import { abortActiveSkill, isSkillRunning } from "../skills/executor.js";
 import { ARROW, flightPath, flightTicks, solvePitch, type Projectile } from "../learn/ballistics.js";
@@ -199,6 +200,7 @@ export function raceSnapshot() {
         rods: b ? count(b, "blaze_rod") : 0,
         eyes: b ? count(b, "ender_eye") : 0,
         pearls: b ? count(b, "ender_pearl") : 0,
+        score: coach.scoreOf(name),
         doing: d?.text ?? (e ? "waiting" : "offline"),
         doingAt: d?.at ?? null,
       };
@@ -2186,7 +2188,7 @@ function confirmedGone(key: string, cond: boolean): boolean {
 // ── Team talk and self-recovery ─────────────────────────────────────────────
 async function talk(bot: Bot, kind: string, text: string, cooldownMs = 20_000): Promise<void> {
   const { say } = await import("./team-comms.js");
-  say(bot, `sr-${kind}`, text, cooldownMs);
+  if (say(bot, `sr-${kind}`, text, cooldownMs)) spokeAt.set(bot.username, Date.now());
 }
 
 /** Dig out of a pocket: clear feet and head cells on each side in turn and step through. */
@@ -2239,6 +2241,24 @@ async function unstick(bot: Bot): Promise<void> {
   }
 }
 
+// ── Behaviour coaching ───────────────────────────────────────────────────────
+const coach = new Coach();
+interface Win {
+  t: number;
+  p: Vec3;
+  d: number | null;
+  farSecs: number;
+  nearLead: boolean;
+  intentional: boolean;
+  died: boolean;
+  diedStalled: boolean;
+}
+const coachWin = new Map<string, Win>();
+const stillSince = new Map<string, number>();
+const spokeAt = new Map<string, number>();
+const BASE_STUCK_MS = Number(process.env.ESCAPE_STUCK_MS || 25_000);
+const BASE_REGROUP = Number(process.env.REGROUP_DISTANCE || 180);
+
 // ── Regroup: bring far-away teammates to the leader ──────────────────────────
 // A bot cannot run commands (the no-cheat guard drops them), so, like the kit keeper, this asks the
 // local server console to teleport it. Used only when a teammate is hopelessly far behind
@@ -2267,7 +2287,8 @@ async function regroupToLeader(bot: Bot, lead: Bot): Promise<boolean> {
   if (process.env.REGROUP_TP === "false" || !lead.entity || !bot.entity || lead === bot) return false;
   if (Date.now() - (lastTp.get(bot.username) ?? 0) < Number(process.env.REGROUP_COOLDOWN_MS || 240_000)) return false;
   const sameDim = dim(lead) === dim(bot);
-  const far = !sameDim || flat(bot.entity.position, lead.entity.position) > Number(process.env.REGROUP_DISTANCE || 180);
+  const leash = coach.adapt(bot.username, { stuckMs: BASE_STUCK_MS, regroupDistance: BASE_REGROUP }).regroupDistance;
+  const far = !sameDim || flat(bot.entity.position, lead.entity.position) > leash;
   if (!far) return false;
   lastTp.set(bot.username, Date.now());
   const out = await rconCommand(`tp ${bot.username} ${lead.username}`);
@@ -3049,6 +3070,13 @@ export function startSpeedrun(bot: Bot, brain: Pausable): void {
     .catch((e) => console.warn(`[Race] ${(e as Error).message}`));
   bot.on("death", () => {
     endWait.delete(bot.username); // wait for the squad again before the next try
+    {
+      const w = coachWin.get(bot.username);
+      if (w) {
+        w.died = true;
+        w.diedStalled = Date.now() - (stillSince.get(bot.username) ?? Date.now()) > 15_000;
+      }
+    }
     doing(bot, "died, respawning");
     // Learn from it: every later route in this dimension prices this spot up.
     const p = bot.entity?.position;
@@ -3140,7 +3168,40 @@ export function startSpeedrun(bot: Bot, brain: Pausable): void {
     const dtext = doingMap.get(bot.username)?.text ?? "";
     const intentional = waiting || /waiting|crafting|handed|throwing|setting a respawn|unstuck/.test(dtext);
     sampleHistory(bot);
-    if (!intentional && Date.now() - anchor.at > Number(process.env.ESCAPE_STUCK_MS || 25_000)) {
+    stillSince.set(bot.username, anchor.at);
+    {
+      // Coaching window: what did this bot do over the last 30 s, and was it any good?
+      const nowMs = Date.now();
+      const destNow = destOf.get(bot.username);
+      const dNow = destNow && nowMs - destNow.at < 90_000 ? pos.distanceTo(destNow.p) : null;
+      let w = coachWin.get(bot.username);
+      if (!w) coachWin.set(bot.username, (w = { t: nowMs, p: pos.clone(), d: dNow, farSecs: 0, nearLead: false, intentional: false, died: false, diedStalled: false }));
+      const boss = captain() ?? leader();
+      const leash = coach.adapt(bot.username, { stuckMs: BASE_STUCK_MS, regroupDistance: BASE_REGROUP }).regroupDistance;
+      if (boss && boss !== bot && boss.entity && dim(boss) === dim(bot)) {
+        const gapLead = flat(pos, boss.entity.position);
+        if (gapLead > leash) w.farSecs++;
+        w.nearLead = gapLead < 35;
+      }
+      w.intentional = w.intentional || intentional;
+      if (nowMs - w.t >= 30_000) {
+        const sig: Signals = {
+          moved: flat(pos, w.p),
+          closer: w.d != null && dNow != null ? w.d - dNow : flat(pos, w.p),
+          intentionalWait: w.intentional,
+          secondsFarFromLead: w.farSecs,
+          nearLead: w.nearLead,
+          died: w.died,
+          diedWhileStalled: w.diedStalled,
+          spoke: nowMs - (spokeAt.get(bot.username) ?? 0) < 30_000,
+        };
+        const r = coach.record(bot.username, sig, nowMs);
+        if (r.total <= -1 || r.total >= 1.5) console.log(`[Coach] ${bot.username}: ${r.total > 0 ? "good" : "poor"} window ${r.total} ${JSON.stringify(r.parts)} (running score ${coach.scoreOf(bot.username)})`);
+        coachWin.set(bot.username, { t: nowMs, p: pos.clone(), d: dNow, farSecs: 0, nearLead: false, intentional: false, died: false, diedStalled: false });
+      }
+    }
+    const stuckLimit = coach.adapt(bot.username, { stuckMs: BASE_STUCK_MS, regroupDistance: BASE_REGROUP }).stuckMs;
+    if (!intentional && Date.now() - anchor.at > stuckLimit) {
       anchor = { p: pos.clone(), at: Date.now() };
       busy = true;
       void escapeStuck(bot).finally(() => (busy = false));

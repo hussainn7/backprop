@@ -202,7 +202,7 @@ function renderSquads(squads) {
           ${b.online ? `<span>🍗 ${b.food}</span>` : ""}
           ${b.pos ? `<span>📍 ${b.pos.join(" ")}</span>` : ""}
           ${b.held ? `<span>✋ ${esc(b.held.replace(/_/g, " "))}</span>` : ""}
-          ${b.rods ? `<span>🔥 ${b.rods}</span>` : ""}${b.eyes ? `<span>👁 ${b.eyes}</span>` : ""}
+          ${b.rods ? `<span>🔥 ${b.rods}</span>` : ""}${b.eyes ? `<span>👁 ${b.eyes}</span>` : ""}${b.online && b.score !== undefined ? `<span title="behaviour score: progress, stalls, deaths, staying with the team">⭐ ${b.score}</span>` : ""}
         </div>
       </div>`;
     }).join("");
