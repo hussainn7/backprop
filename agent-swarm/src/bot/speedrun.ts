@@ -456,6 +456,7 @@ async function pearlHop(bot: Bot, dest: { x: number; z: number }): Promise<boole
 
 /** Where each bot is currently trying to get to; the swimmer steers by it while in water. */
 const destOf = new Map<string, { p: Vec3; at: number }>();
+const shoreAt = new Map<string, { at: number; p: Vec3 | null }>();
 function setDest(bot: Bot, p: { x: number; y?: number; z: number }): void {
   destOf.set(bot.username, { p: new Vec3(p.x, p.y ?? bot.entity.position.y, p.z), at: Date.now() });
 }
@@ -992,6 +993,24 @@ async function crossTo(bot: Bot, doorway: XYZ, want: "nether" | "overworld" | "e
     await march(bot, doorway, 120_000, () => bot.entity.position.distanceTo(v(doorway)) < 12);
     // Still far (a respawn 2,000 blocks off): keep marching on the next step, don't try the portal from here.
     if (bot.entity.position.distanceTo(v(doorway)) > 40) return false;
+  }
+  // A doorway on a ledge or hilltop (the pathfinder will not climb 9+ blocks): cut a way up to its
+  // height first, or down to it, then cross.
+  {
+    const dyDoor = doorway.y - bot.entity.position.y;
+    if (flat(bot.entity.position, doorway) < 24 && dyDoor > 3) {
+      doing(bot, `climbing to the portal doorway (${Math.round(dyDoor)} up)`);
+      if (!(await ascendTo(bot, doorway.y, doorway))) {
+        await sleep(2000);
+        return false;
+      }
+    } else if (flat(bot.entity.position, doorway) < 24 && dyDoor < -8) {
+      doing(bot, `digging down to the portal doorway (${Math.round(-dyDoor)} down)`);
+      if (!(await descendTo(bot, doorway.y))) {
+        await sleep(2000);
+        return false;
+      }
+    }
   }
   if (want === "nether" && state.overworldPortal && flat(doorway, state.overworldPortal) < 1) {
     await bedAtPortal(bot, doorway).catch((e) => console.warn(`[Speedrun] ${bot.username} bed failed: ${(e as Error).message}`));
@@ -2415,14 +2434,21 @@ export function startSpeedrun(bot: Bot, brain: Pausable): void {
       }
       return;
     }
+    // Always in charge while in water (a bot with no destination used to just drown): head for
+    // its destination when it has one, otherwise the nearest shore, otherwise straight up.
     const d = destOf.get(bot.username);
-    if (!d || Date.now() - d.at > 90_000) return; // no destination: leave it to the other logic
+    let target: Vec3;
+    if (d && Date.now() - d.at <= 90_000) target = d.p;
+    else {
+      if (!shoreAt.has(bot.username) || Date.now() - shoreAt.get(bot.username)!.at > 1500) shoreAt.set(bot.username, { at: Date.now(), p: nearestLand(bot) });
+      target = shoreAt.get(bot.username)!.p ?? bot.entity.position.offset(0.5, 6, 0.5);
+    }
     if (!swimActive) {
       swimActive = true;
       origSetGoal(null);
       doing(bot, "swimming (diving, watching air)");
     }
-    swimmer.step(d.p);
+    swimmer.step(target);
   }, 250);
   bot.once("end", () => clearInterval(swimTimer));
   let lastHp = 20;

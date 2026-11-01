@@ -19,7 +19,7 @@ import { Vec3 } from "vec3";
 
 const WATERY = new Set(["water", "bubble_column", "kelp", "kelp_plant", "seagrass", "tall_seagrass"]);
 const MAX_AIR = 20;
-const SURFACE_BELOW = 8; // surface when air drops under this (of 20)
+const SURFACE_BELOW = 11; // surface when air drops under this (of 20): leave room to swim up from depth
 const DIVE_ABOVE = 16; // dive again only with this much air
 
 export type SwimMode = "air" | "shore" | "shallow" | "dive" | "paddle" | "dry";
