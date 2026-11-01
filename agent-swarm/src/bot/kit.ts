@@ -37,6 +37,7 @@ const KIT = (n: string): string[] => [
 ];
 
 let started = false;
+const lastBoatGive = new Map<string, number>();
 
 export function kitBots(squadBots: string[]): string[] {
   const raw = (process.env.KIT_BOTS || "").trim();
@@ -113,7 +114,8 @@ export function startKitKeeper(squadBots: string[]): void {
           }
           // A boat per bot: ~8 blocks/s on water against ~3 swimming.
           const bt: string = await rcon.send(`clear ${n} minecraft:oak_boat 0`);
-          if (!/No player was found|No entity was found/.test(bt) && !/Found [1-9]\d* matching/.test(bt)) {
+          if (!/No player was found|No entity was found/.test(bt) && !/Found [1-9]\d* matching/.test(bt) && Date.now() - (lastBoatGive.get(n) ?? 0) > 900_000) {
+            lastBoatGive.set(n, Date.now()); // a bot that keeps losing its boat was refilled 227 times: cap it
             await rcon.send(`give ${n} minecraft:oak_boat 1`);
             console.log(`[Kit] ${n}: oak_boat`);
           }

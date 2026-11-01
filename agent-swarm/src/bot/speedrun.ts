@@ -2275,8 +2275,28 @@ const boating = new Set<string>();
 const vehicleOf = (b: Bot): Entity | null => (b as unknown as { vehicle?: Entity | null }).vehicle ?? null;
 const lastBoat = new Map<string, number>();
 
+/** Open water ahead: sky overhead and at least 12 of the next 16 blocks toward dest are water. */
+function openWaterAhead(bot: Bot, dest: Vec3): boolean {
+  const me = bot.entity.position;
+  const f = me.floored();
+  for (let dy = 1; dy <= 6; dy++) {
+    const b = bot.blockAt(f.offset(0, dy, 0));
+    if (b && b.boundingBox === "block") return false; // a roof: a cave, not a lake
+  }
+  const dx = dest.x - me.x;
+  const dz = dest.z - me.z;
+  const len = Math.hypot(dx, dz) || 1;
+  let wet = 0;
+  for (let i = 1; i <= 16; i++) {
+    const q = new Vec3(Math.floor(me.x + (dx / len) * i), Math.floor(me.y), Math.floor(me.z + (dz / len) * i));
+    if (/water/.test(bot.blockAt(q)?.name ?? "") || /water/.test(bot.blockAt(q.offset(0, -1, 0))?.name ?? "")) wet++;
+  }
+  return wet >= 12;
+}
+
 async function boatTravel(bot: Bot, dest: Vec3): Promise<boolean> {
   if (boating.has(bot.username) || boatsDisabled() || !count(bot, "oak_boat")) return false;
+  if (!openWaterAhead(bot, dest)) return false; // not worth a boat (and a cave pool cannot take one)
   if (Date.now() - (lastBoat.get(bot.username) ?? 0) < 60_000) return false;
   lastBoat.set(bot.username, Date.now());
   boating.add(bot.username);
