@@ -1181,7 +1181,10 @@ async function strongholdLeg(bot: Bot): Promise<void> {
   const s = state.stronghold;
   if (s && s.exact && flat(me, { x: s.x, z: s.z }) < 16) {
     // Right above it: dig down in a staircase toward y=30 and look again.
-    await digDownToward(bot, 30);
+    // Down in short stairs, looking for portal frames after each (they load as the bot descends).
+    for (let k = 0; k < 6 && !noteFrames(bot) && bot.entity.position.y > 14; k++) {
+      if (!(await descendTo(bot, Math.max(12, Math.round(bot.entity.position.y) - 12)))) break;
+    }
     noteFrames(bot);
     return;
   }
@@ -1203,14 +1206,6 @@ async function strongholdLeg(bot: Bot): Promise<void> {
   noteFrames(bot);
 }
 
-/** Staircase down (two blocks forward per block down) to `y`; never straight down. */
-async function digDownToward(bot: Bot, y: number): Promise<void> {
-  const p = bot.entity.position.floored();
-  if (p.y <= y) return;
-  const target = p.offset(Math.max(4, Math.min(24, (p.y - y) * 1)), -(p.y - y), 0);
-  bot.pathfinder.setMovements(moves(bot, true));
-  await safeGoto(bot, new goals.GoalNear(target.x, target.y, target.z, 3), 90_000).catch(() => {});
-}
 
 // Clockwise square spiral around a 3x3 ring: one block down per step, never straight down.
 const SPIRAL: [number, number][] = [
