@@ -1212,12 +1212,94 @@ async function digDownToward(bot: Bot, y: number): Promise<void> {
   await safeGoto(bot, new goals.GoalNear(target.x, target.y, target.z, 3), 90_000).catch(() => {});
 }
 
+// Clockwise square spiral around a 3x3 ring: one block down per step, never straight down.
+const SPIRAL: [number, number][] = [
+  [1, 0], [1, 0], [0, 1], [0, 1], [-1, 0], [-1, 0], [0, -1], [0, -1],
+];
+const HAZARD = /lava|water|magma|fire|spawner|bubble/;
+
+/** True when digging at `c` (and standing there) is safe: no liquids around, solid floor below. */
+function cellSafe(bot: Bot, c: Vec3): boolean {
+  for (const [dx, dy, dz] of [[0, 0, 0], [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]) {
+    const n = bot.blockAt(c.offset(dx, dy, dz))?.name ?? "unknown";
+    if (HAZARD.test(n)) return false;
+  }
+  // Falling blocks above would bury the bot as soon as the support is dug out.
+  const above = bot.blockAt(c.offset(0, 2, 0))?.name ?? "";
+  return !/sand|gravel/.test(above);
+}
+
+/**
+ * Dig a spiral staircase down to `targetY` right where the bot stands. The pathfinder
+ * will not plan 40+ blocks of straight descent, and a stair is the one shape that is
+ * safe to dig blind: each step is checked for liquids and cave floors first.
+ */
+async function descendTo(bot: Bot, targetY: number): Promise<boolean> {
+  const until = Date.now() + 240_000;
+  let i = 0;
+  let aborted = "";
+  doing(bot, `digging down to y=${targetY} (${Math.round(bot.entity.position.y - targetY)} to go)`);
+  while (bot.entity && bot.entity.position.y > targetY + 1 && Date.now() < until && currentMode() === "game") {
+    const p = bot.entity.position.floored();
+    const [dx, dz] = SPIRAL[i % SPIRAL.length];
+    const ahead = p.offset(dx, 0, dz);
+    const cells = [ahead.offset(0, 1, 0), ahead, ahead.offset(0, -1, 0)];
+    const floor = ahead.offset(0, -2, 0);
+    if (!cells.every((c) => cellSafe(bot, c)) || bot.blockAt(floor)?.boundingBox !== "block") {
+      aborted = `unsafe step at ${ahead} (floor ${bot.blockAt(floor)?.name})`;
+      break;
+    }
+    await equip(bot, "netherite_pickaxe");
+    for (const c of cells) {
+      const b = bot.blockAt(c);
+      if (b && b.boundingBox === "block") await bot.dig(b, true).catch(() => {});
+    }
+    // Walk onto the cleared column; gravity drops the bot into the lowest cell.
+    bot.pathfinder.setGoal(null);
+    const centre = ahead.offset(0.5, 0, 0.5);
+    bot.setControlState("forward", true);
+    const t = Date.now();
+    while (Date.now() - t < 2500) {
+      await bot.lookAt(centre.offset(0, 1.6, 0), true).catch(() => {});
+      const q = bot.entity.position;
+      if (Math.hypot(q.x - centre.x, q.z - centre.z) < 0.4 && q.y < p.y - 0.5) break;
+      await sleep(80);
+    }
+    bot.setControlState("forward", false);
+    if (bot.entity.position.y > p.y - 0.5) {
+      aborted = `stuck at ${p}`;
+      break;
+    }
+    i++;
+    await topUp(bot);
+  }
+  bot.clearControlStates();
+  const y = Math.round(bot.entity.position.y);
+  console.log(`[Speedrun] ${bot.username}: stair dug to y=${y} in ${i} steps${aborted ? ` (stopped: ${aborted})` : ""}`);
+  return bot.entity.position.y <= targetY + 1;
+}
+
 async function fillPortal(bot: Bot): Promise<void> {
   doing(bot, "filling the End portal frames");
   const ep = state.endPortal!;
   const frames = findFrames(bot, 64);
   if (!frames.length) {
     await march(bot, ep, 120_000, () => findFrames(bot, 64).length > 0);
+    return;
+  }
+  // The stronghold's portal room is deep underground: dig a stair down to it first.
+  const roomY = Math.min(...frames.map((f) => f.y));
+  if (bot.entity.position.y > roomY + 6) {
+    const horiz = flat(bot.entity.position, frames[0]);
+    if (horiz > 6) {
+      await goNear(bot, { x: frames[0].x, y: bot.entity.position.y, z: frames[0].z }, 3, 45_000);
+      return;
+    }
+    if (!(await descendTo(bot, roomY + 1))) {
+      // Could not go down here (liquid or a cave below): try another column a few blocks over.
+      const a = Math.random() * Math.PI * 2;
+      await goNear(bot, { x: frames[0].x + Math.cos(a) * 6, y: bot.entity.position.y, z: frames[0].z + Math.sin(a) * 6 }, 2, 20_000);
+    }
     return;
   }
   const empty = frames.filter((f) => !frameHasEye(bot, f));
