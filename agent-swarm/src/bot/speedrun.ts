@@ -1050,11 +1050,33 @@ async function walkInto(bot: Bot, near: XYZ, block: string, done: () => boolean)
       const floor = bot.blockAt(st.offset(0, -1, 0));
       if (feet?.boundingBox === "empty" && head?.boundingBox === "empty" && floor?.boundingBox === "block") stands.push({ stand: st, cell: c });
     }
+  if (block === "end_portal") {
+    // The portal is ringed by frame blocks: the place to stand is ON a frame (top is 13/16 high), one step
+    // from the portal. Open floor beside the portal does not exist.
+    for (const c of cells.filter((c) => c.y === low))
+      for (const [dx, dz] of [
+        [1, 0],
+        [-1, 0],
+        [0, 1],
+        [0, -1],
+      ]) {
+        const frame = c.offset(dx, 0, dz);
+        if (isCell(frame) || bot.blockAt(frame)?.name !== "end_portal_frame") continue;
+        const st = frame.offset(0, 1, 0);
+        const feet = bot.blockAt(st);
+        const head = bot.blockAt(st.offset(0, 1, 0));
+        if (feet?.boundingBox === "empty" && head?.boundingBox === "empty") stands.push({ stand: st, cell: c });
+      }
+  }
   stands.sort((a, b) => a.stand.distanceTo(bot.entity.position) - b.stand.distanceTo(bot.entity.position));
+  console.log(`[Speedrun] ${bot.username}: walkInto ${block}: ${cells.length} cells (lowest y=${low}), ${stands.length} stand spots, bot at ${bot.entity.position.floored()}`);
   for (const { stand, cell } of stands.slice(0, 3)) {
     bot.pathfinder.setMovements(moves(bot, false));
     await safeGoto(bot, new goals.GoalBlock(stand.x, stand.y, stand.z), 20_000).catch(() => {});
-    if (bot.entity.position.distanceTo(stand.offset(0.5, 0, 0.5)) > 1.2) continue;
+    if (bot.entity.position.distanceTo(stand.offset(0.5, 0, 0.5)) > 1.2) {
+      console.log(`[Speedrun] ${bot.username}: walkInto could not reach the stand at ${stand} (now ${bot.entity.position.floored()})`);
+      continue;
+    }
     bot.pathfinder.setGoal(null);
     const centre = cell.offset(0.5, 0, 0.5);
     bot.setControlState("forward", true);
@@ -2919,6 +2941,48 @@ export function startSpeedrun(bot: Bot, brain: Pausable): void {
     if (bot.health < lastHp - 0.5) hurtAt.set(bot.username, Date.now());
     lastHp = bot.health;
   });
+  // Combat reflex: a hostile within reach that just hurt this bot gets fought NOW, from a timer that runs
+  // 8 times a second no matter what the bot is doing. Before, attackers were only noticed between actions,
+  // and one action can last 15-45 s: Cinder stood taking hits from a zombie for a minute.
+  let reflexBusy = false;
+  const reflexTimer = setInterval(() => {
+    if (reflexBusy || !bot.entity || bot.health <= 0 || currentMode() !== "game") return;
+    if (Date.now() - (hurtAt.get(bot.username) ?? 0) > 3500) return; // only when something just hurt us
+    if (swimmer.inWater() || inLavaNow(bot) || boating.has(bot.username)) return;
+    const me = bot.entity.position;
+    const foe = bot.nearestEntity((e) => FOES.has(e.name ?? "") && e.isValid && e.position.distanceTo(me) <= 5.5 && e.name !== "blaze");
+    if (!foe) return;
+    reflexBusy = true;
+    void (async () => {
+      try {
+        bot.pathfinder.setGoal(null);
+        bot.clearControlStates();
+        await equipSword(bot);
+        const until = Date.now() + 9000;
+        let last = 0;
+        while (foe.isValid && bot.health > 0 && Date.now() < until && foe.position.distanceTo(bot.entity.position) <= 7) {
+          if (bot.health <= 7) await topUp(bot);
+          const gap = foe.position.distanceTo(bot.entity.position);
+          await bot.lookAt(foe.position.offset(0, (foe.height ?? 1.8) * 0.8, 0), true).catch(() => {});
+          if (gap > 3.1) {
+            bot.setControlState("forward", true);
+            bot.setControlState("sprint", true);
+          } else {
+            bot.clearControlStates();
+            if (Date.now() - last > 560) {
+              last = Date.now();
+              bot.attack(foe);
+            }
+          }
+          await sleep(90);
+        }
+      } finally {
+        bot.clearControlStates();
+        reflexBusy = false;
+      }
+    })();
+  }, 120);
+  bot.once("end", () => clearInterval(reflexTimer));
   // Projectile dodge: blaze fireballs, ghast fireballs and arrows that are flying at this bot.
   const seen = new Map<number, { p: Vec3; at: number }>();
   let dodging = false;
