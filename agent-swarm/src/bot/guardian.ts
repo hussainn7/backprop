@@ -98,7 +98,7 @@ export function startGuardian(): void {
   const cycle = async () => {
     if (!huntIsPrimary()) return;
     const now = Date.now();
-    rcon ??= await Rcon.connect({ host: "127.0.0.1", port: settings.port, password: settings.password, timeout: 3000 });
+    rcon ??= await Rcon.connect({ host: "127.0.0.1", port: settings.port, password: settings.password, timeout: 6000 });
     const send = (cmd: string) => rcon!.send(cmd);
 
     const him = parsePos(await send(`data get entity ${target} Pos`));
