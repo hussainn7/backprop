@@ -687,13 +687,20 @@ async function craft(bot: Bot, name: string, times: number): Promise<number> {
   for (let i = 0; i < times; i++) {
     const recipe = bot.recipesFor(item.id, null, 1, null)[0];
     if (!recipe) break;
-    try {
-      await bot.craft(recipe, 1, undefined);
-      made++;
-    } catch (err) {
-      console.warn(`[Speedrun] ${bot.username} craft ${name} #${i + 1}/${times} failed: ${(err as Error).message}`);
-      break;
+    let ok = false;
+    // "missing ingredient" right after a craft is the inventory not having synced yet: wait, retry.
+    for (let attempt = 0; attempt < 4 && !ok; attempt++) {
+      try {
+        await bot.craft(recipe, 1, undefined);
+        ok = true;
+      } catch (err) {
+        if (attempt === 3) console.warn(`[Speedrun] ${bot.username} craft ${name} #${i + 1}/${times} failed: ${(err as Error).message}`);
+        await sleep(350);
+      }
     }
+    if (!ok) break;
+    made++;
+    await sleep(60);
   }
   return made;
 }
@@ -2134,6 +2141,11 @@ async function step(bot: Bot): Promise<void> {
         const pending = others.some((b) => count(b, "ender_eye") || count(b, "blaze_rod") || count(b, "blaze_powder"));
         const since = Date.now() - Date.parse(state.splits.eyes ?? state.startedAt);
         const eyes = count(bot, "ender_eye");
+        const ownPowder = count(bot, "blaze_rod") > 0 || (count(bot, "blaze_powder") > 0 && count(bot, "ender_pearl") > 0);
+        if (ownPowder) {
+          await sleep(500); // craftEyes runs again next step
+          return;
+        }
         if (eyes >= PORTAL_EYES + 2 && (!pending || since > 120_000)) setPhase("stronghold", `${eyes} eyes of ender in hand. Throwing the first one!`);
         else if (eyes > 0 && !pending) setPhase("stronghold", `${eyes} eyes of ender in hand. Throwing the first one!`);
         else if (confirmedGone("eyes-gone", eyes === 0 && !pending && !squadCount("blaze_rod") && !squadCount("blaze_powder"))) {
@@ -2152,6 +2164,10 @@ async function step(bot: Bot): Promise<void> {
         return;
       }
       if (bot === lead) {
+        if (count(bot, "blaze_powder") && count(bot, "ender_pearl")) {
+          await craftEyes(bot); // finish turning every powder into an eye before searching
+          if (count(bot, "blaze_powder") && count(bot, "ender_pearl")) return;
+        }
         if (!count(bot, "ender_eye") && squadBots().some((b) => count(b, "ender_eye") || count(b, "blaze_rod") || count(b, "blaze_powder"))) {
           setPhase("eyes", `${me} has no eyes; squad, bring rods and eyes to me`);
           return;
