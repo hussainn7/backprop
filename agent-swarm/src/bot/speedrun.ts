@@ -1421,7 +1421,11 @@ async function strongholdLeg(bot: Bot): Promise<void> {
   // Never throw into the 12 the portal needs (counting what squadmates carry),
   // except once right on top of the estimate, where one dive settles it.
   const squadEyes = squadCount("ender_eye");
-  const mayThrow = eyes > 0 && (squadEyes > PORTAL_EYES || (!!est && flat(me, est) < 32));
+  // Before the first estimate the search needs throws (2+ from different spots); only once the
+  // stronghold is known must the portal's 12 be protected. Reserving 12 from the start made a
+  // squad with exactly 12 eyes unable to throw even one.
+  const reserve = est ? PORTAL_EYES : 8;
+  const mayThrow = eyes > 0 && (squadEyes > reserve || (!!est && flat(me, est) < 32));
   if (mayThrow) {
     const r = await throwEye(bot);
     if (r) {
