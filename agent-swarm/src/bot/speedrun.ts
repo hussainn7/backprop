@@ -230,6 +230,88 @@ function sharedPortal(): XYZ | null {
   return p;
 }
 
+// ── Shared world knowledge ──────────────────────────────────────────────────
+// All squads play one world. The first to find something tells the rest, so a
+// portal, fortress, spawner, stronghold or End portal is only ever searched for once.
+const SHARED_WORLD = path.join("logs", "shared-world.json");
+interface SharedWorld {
+  overworldPortal?: XYZ;
+  fortress?: XYZ;
+  spawner?: XYZ;
+  stronghold?: { x: number; z: number; exact: boolean };
+  endFrames?: XYZ;
+}
+let sharedWorldCache: { at: number; w: SharedWorld } = { at: 0, w: {} };
+function readSharedWorld(): SharedWorld {
+  if (Date.now() - sharedWorldCache.at < 3000) return sharedWorldCache.w;
+  let w: SharedWorld = {};
+  try {
+    w = JSON.parse(fs.readFileSync(SHARED_WORLD, "utf8"));
+  } catch {
+    /* nothing shared yet */
+  }
+  sharedWorldCache = { at: Date.now(), w };
+  return w;
+}
+function writeSharedWorld(patch: SharedWorld): void {
+  try {
+    const w = { ...readSharedWorld(), ...patch };
+    fs.mkdirSync(path.dirname(SHARED_WORLD), { recursive: true });
+    const tmp = `${SHARED_WORLD}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(w));
+    fs.renameSync(tmp, SHARED_WORLD);
+    sharedWorldCache = { at: Date.now(), w };
+  } catch {
+    /* best effort */
+  }
+}
+
+/** Push what this squad knows that is new, pull what it lacks, and skip phases that became pointless. */
+function syncShared(): void {
+  const w = readSharedWorld();
+  const patch: SharedWorld = {};
+  // push
+  if (state.overworldPortal && !w.overworldPortal) patch.overworldPortal = state.overworldPortal;
+  if (state.fortress && !w.fortress) patch.fortress = state.fortress;
+  if (state.spawner && !w.spawner) patch.spawner = state.spawner;
+  if (state.endPortal && !w.endFrames) patch.endFrames = state.endPortal;
+  const mine = state.stronghold;
+  if (mine && (!w.stronghold || (mine.exact && !w.stronghold.exact))) patch.stronghold = mine;
+  if (Object.keys(patch).length) {
+    writeSharedWorld(patch);
+    announce(`Shared with the other squads: ${Object.keys(patch).join(", ")}`);
+  }
+  const phaseIdx = PHASES.indexOf(state.phase);
+  // pull
+  if (w.overworldPortal && !state.overworldPortal) {
+    state.overworldPortal = w.overworldPortal;
+    save();
+  }
+  if (w.overworldPortal && state.phase === "portal") {
+    setPhase("nether", `using the shared portal at ${w.overworldPortal.x} ${w.overworldPortal.y} ${w.overworldPortal.z}`);
+  }
+  if (w.fortress && !state.fortress) {
+    state.fortress = w.fortress;
+    save();
+  }
+  if (w.fortress && (state.phase === "nether" || state.phase === "fortress")) {
+    setPhase("blaze", `using the shared fortress at ${w.fortress.x} ${w.fortress.y} ${w.fortress.z}`);
+  }
+  if (w.spawner && !state.spawner) {
+    state.spawner = w.spawner;
+    save();
+  }
+  if (w.stronghold && (!state.stronghold || (w.stronghold.exact && !state.stronghold.exact))) {
+    state.stronghold = w.stronghold;
+    save();
+  }
+  if (w.endFrames && !state.endPortal && phaseIdx < PHASES.indexOf("fill")) {
+    state.endPortal = w.endFrames;
+    save();
+    if (state.phase === "stronghold") setPhase("fill", `using the shared End portal at ${w.endFrames.x} ${w.endFrames.y} ${w.endFrames.z}`);
+  }
+}
+
 function setPhase(next: Phase, why: string): void {
   if (state.phase === next) return;
   if (next === "end" && state.endPortal) shareOpenPortal(state.endPortal);
@@ -1677,6 +1759,7 @@ async function step(bot: Bot): Promise<void> {
   // The overworld half of the route is run by the captain (the leader when it is there).
   const lead = ["home", "eyes", "stronghold", "fill"].includes(state.phase) ? captain() : leader();
   const idx = Math.max(0, order(me));
+  syncShared();
   // Someone opened a portal already: no eyes, rods or stronghold needed, go straight to it.
   const open = sharedPortal();
   if (open && PHASES.indexOf(state.phase) < PHASES.indexOf("end")) {
