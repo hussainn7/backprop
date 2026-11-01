@@ -8,6 +8,12 @@
 // missing (a fresh bot, or gear lost some other way). Every bot of the squad,
 // kitted or not, also gets a bow and arrows if it has no bow (BOWS_FOR_ALL,
 // default on): the learned "shoot" tactic needs one.
+//
+// SPEEDRUN_KIT=true adds the tools and materials that skip the early game for
+// the same bots: netherite pickaxe/axe/shovel, water bucket, flint and steel,
+// 14 obsidian (a portal), crafting table, furnace, beds, torches, logs, iron
+// and gold (piglin bartering). Blaze rods and eyes of ender are NOT given:
+// those are the race. Re-applied when the netherite pickaxe is missing.
 
 import { createRequire } from "node:module";
 import { rconSettings } from "./hunter.js";
@@ -40,6 +46,23 @@ export function kitBots(squadBots: string[]): string[] {
   return squadBots.filter((b) => wanted.has(b.toLowerCase()));
 }
 
+const TOOL = 'minecraft:unbreakable={}';
+const SPEEDRUN = (n: string): string[] => [
+  `give ${n} minecraft:netherite_pickaxe[minecraft:enchantments={levels:{"minecraft:efficiency":5,"minecraft:fortune":3}},${TOOL}] 1`,
+  `give ${n} minecraft:netherite_axe[minecraft:enchantments={levels:{"minecraft:efficiency":5}},${TOOL}] 1`,
+  `give ${n} minecraft:netherite_shovel[minecraft:enchantments={levels:{"minecraft:efficiency":5}},${TOOL}] 1`,
+  `give ${n} minecraft:water_bucket 1`,
+  `give ${n} minecraft:flint_and_steel[${TOOL}] 1`,
+  `give ${n} minecraft:obsidian 14`,
+  `give ${n} minecraft:crafting_table 1`,
+  `give ${n} minecraft:furnace 1`,
+  `give ${n} minecraft:white_bed 2`,
+  `give ${n} minecraft:torch 64`,
+  `give ${n} minecraft:oak_log 64`,
+  `give ${n} minecraft:iron_ingot 16`,
+  `give ${n} minecraft:gold_ingot 32`,
+];
+
 const BOW = (n: string): string[] => [
   `give ${n} minecraft:bow[minecraft:enchantments={levels:{"minecraft:power":5,"minecraft:punch":2,"minecraft:flame":1,"minecraft:infinity":1}},minecraft:unbreakable={}] 1`,
   `give ${n} minecraft:arrow 64`,
@@ -65,9 +88,17 @@ export function startKitKeeper(squadBots: string[]): void {
         const sword: string = await rcon.send(`clear ${n} minecraft:netherite_sword 0`);
         const hasChest = /netherite_chestplate/.test(chest);
         const hasSword = /Found [1-9]\d* matching/.test(sword);
-        if (hasChest && hasSword) continue;
-        for (const cmd of KIT(n)) await rcon.send(cmd);
-        console.log(`[Kit] ${n}: full loadout applied (${hasChest ? "" : "no armor"}${!hasChest && !hasSword ? ", " : ""}${hasSword ? "" : "no sword"})`);
+        if (!hasChest || !hasSword) {
+          for (const cmd of KIT(n)) await rcon.send(cmd);
+          console.log(`[Kit] ${n}: full loadout applied (${hasChest ? "" : "no armor"}${!hasChest && !hasSword ? ", " : ""}${hasSword ? "" : "no sword"})`);
+        }
+        if (process.env.SPEEDRUN_KIT === "true") {
+          const pick: string = await rcon.send(`clear ${n} minecraft:netherite_pickaxe 0`);
+          if (!/Found [1-9]\d* matching/.test(pick)) {
+            for (const cmd of SPEEDRUN(n)) await rcon.send(cmd);
+            console.log(`[Kit] ${n}: speedrun tools and materials`);
+          }
+        }
       }
       for (const n of bows) {
         const bow: string = await rcon.send(`clear ${n} minecraft:bow 0`);
