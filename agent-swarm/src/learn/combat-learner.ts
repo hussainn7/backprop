@@ -56,6 +56,8 @@ export interface CombatState {
   mobAdjacent?: boolean;
   /** A teammate within 40 blocks has called for help (low health). */
   allyHurt?: boolean;
+  /** This bot is in water (swimming changes what works). */
+  inWater?: boolean;
 }
 
 export interface Experience {
@@ -96,6 +98,7 @@ export const FEATURE_NAMES = [
   "busy",
   "mob",
   "ally hurt",
+  "in water",
 ];
 
 /** Feature vector φ(s): one-hot buckets plus binary flags. */
@@ -111,6 +114,7 @@ export function features(s: CombatState): number[] {
   f[19] = s.targetBusy ? 1 : 0;
   f[20] = s.mobAdjacent ? 1 : 0;
   f[21] = s.allyHurt ? 1 : 0;
+  f[22] = s.inWater ? 1 : 0;
   return f;
 }
 
@@ -118,7 +122,7 @@ export function features(s: CombatState): number[] {
 export function stateKey(s: CombatState): string {
   return (
     `d${distBucket(s.dist)}.hp${hpBucket(s.hp)}.sh${s.targetShielding ? 1 : 0}.h${heightBucket(s.dy)}` +
-    `.al${allyBucket(s.alliesNearTarget)}.m${motionIndex(s.targetMotion)}.b${s.targetBusy ? 1 : 0}.mob${s.mobAdjacent ? 1 : 0}.help${s.allyHurt ? 1 : 0}`
+    `.al${allyBucket(s.alliesNearTarget)}.m${motionIndex(s.targetMotion)}.b${s.targetBusy ? 1 : 0}.mob${s.mobAdjacent ? 1 : 0}.help${s.allyHurt ? 1 : 0}.w${s.inWater ? 1 : 0}`
   );
 }
 

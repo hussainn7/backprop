@@ -362,6 +362,7 @@ export function startHunter(bot: Bot, brain: Pausable): void {
       targetBusy: now - lastTargetSwing < 2000 || now - lastTargetHurt < 2000 || alliesClose > 0,
       mobAdjacent: !!nearestMob(4),
       allyHurt: helpRequests(bot.username, me, dimension()).length > 0,
+      inWater: pursuit.swimmer.inWater(),
     };
   };
 
@@ -872,7 +873,25 @@ export function startHunter(bot: Bot, brain: Pausable): void {
           if (r) say(bot, "backup", `On my way, ${r.bot}! Holding on at ${fmt(r.pos)}.`, 12_000);
         }
       }
-      act(ent, win.tactic, dist, now);
+      // In water the pathfinder is useless: swim at him (air, sprint-swim,
+      // climb-out) and still swing when in reach. Shots and pearls are not
+      // movement, so they run as chosen.
+      const t = win.tactic;
+      if (pursuit.swimmer.inWater() && t !== "shoot" && !t.startsWith("pearl")) {
+        if (followed || goalKind) {
+          bot.pathfinder.setGoal(null);
+          followed = null;
+          goalKind = "";
+        }
+        pursuit.swimmer.step(ent.position);
+        if (dist <= 3.4 && now - lastSwing >= swingMs(bot)) {
+          void bot.lookAt(ent.position.offset(0, (ent.height ?? 1.8) * 0.85, 0), true);
+          swing(ent);
+        }
+      } else {
+        if (pursuit.swimmer.mode !== "dry") pursuit.swimmer.stop();
+        act(ent, t, dist, now);
+      }
     } else {
       // Out of sight or range: close the last window against his real distance,
       // so backing off out of range is penalized like any other retreat (closing

@@ -9,8 +9,8 @@
 //                       the waypoint is reached
 //   near (≤ 64)         head for his predicted position; re-plan only when it
 //                       has moved more than max(3, 10% of the distance)
-//   in water            the pathfinder cannot plan swims; swim straight at him
-//                       (sprint-swim, jump to keep the head up) until ashore
+//   in water            the pathfinder cannot plan swims: the Swimmer takes over
+//                       (air management, underwater sprint-swim, climbing out)
 //   stuck               no ≥ 2-block progress for 6 s: try an ender-pearl hop
 //                       toward him; otherwise detour ±60° for a few seconds;
 //                       after repeated stalls (caves, cliffs) switch to short
@@ -23,6 +23,7 @@
 import type { Bot } from "mineflayer";
 import { Vec3 } from "vec3";
 import pkg from "mineflayer-pathfinder";
+import { Swimmer } from "./swim.js";
 
 const { goals } = pkg;
 
@@ -60,6 +61,8 @@ export class Pursuit {
   private detourSide = 1;
   private lastSetAt = 0;
   private swimming = false;
+  /** Shared with the hunter, which also swims in fights. */
+  readonly swimmer: Swimmer;
   private lastPathAt = 0;
   private noPath = false;
   /** Consecutive stalls without progress; ≥ 2 means short tunnelling steps. */
@@ -70,6 +73,7 @@ export class Pursuit {
     private readonly bot: Bot,
     private readonly hooks: PursuitHooks = {},
   ) {
+    this.swimmer = new Swimmer(bot);
     bot.on("path_update" as never, ((r: { status: string; path?: unknown[]; visitedNodes?: number; time?: number }) => {
       this.lastPathAt = Date.now();
       this.noPath = r.status === "noPath";
@@ -154,16 +158,13 @@ export class Pursuit {
     }
     if (now < this.detourUntil) return; // let the detour play out
 
-    if (this.inWater(me)) {
+    if (this.swimmer.inWater()) {
       if (!this.swimming) {
         this.swimming = true;
         this.bot.pathfinder.setGoal(null);
         this.goalPoint = null;
       }
-      void this.bot.look(Math.atan2(-(aim.x - me.x), -(aim.z - me.z)), 0, true);
-      this.bot.setControlState("forward", true);
-      this.bot.setControlState("sprint", true);
-      this.bot.setControlState("jump", true);
+      this.swimmer.step(aim);
       return;
     }
     this.stopSwimming();
@@ -195,17 +196,10 @@ export class Pursuit {
     return new Vec3(me.x + Math.cos(b) * 35, me.y, me.z + Math.sin(b) * 35);
   }
 
-  /** Feet or head in water (this mineflayer build does not set entity.isInWater). */
-  private inWater(me: Vec3): boolean {
-    if ((this.bot.entity as unknown as { isInWater?: boolean }).isInWater) return true;
-    const at = (dy: number) => this.bot.blockAt?.(me.floored().offset(0, dy, 0))?.name;
-    return at(0) === "water" || at(1) === "water";
-  }
-
   private stopSwimming(): void {
     if (!this.swimming) return;
     this.swimming = false;
-    for (const c of ["forward", "sprint", "jump"] as const) this.bot.setControlState(c, false);
+    this.swimmer.stop();
   }
 
   private setXZ(p: Vec3, range: number): void {
