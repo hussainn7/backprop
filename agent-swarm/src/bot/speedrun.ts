@@ -1937,8 +1937,12 @@ async function fillPortal(bot: Bot): Promise<void> {
 async function jumpIn(bot: Bot): Promise<void> {
   doing(bot, "jumping into the End portal");
   const id = bot.registry.blocksByName.end_portal?.id;
-  const cell = id !== undefined ? bot.findBlock({ matching: id, maxDistance: 48 }) : null;
-  if (!cell) {
+  const cell = id !== undefined ? throttled(`portalcell:${bot.username}`, 3000, () => bot.findBlock({ matching: id, maxDistance: 48 })) : null;
+  // The portal can be "in view" (within 48 blocks) while still tens of blocks below the bot, in rock:
+  // being close is not being able to reach it. Whenever the bot is well above the portal's level, get
+  // over it and cut the stair down first, whether or not the portal cell is visible.
+  const epHigh = state.endPortal && bot.entity.position.y > state.endPortal.y + 8;
+  if (!cell || epHigh) {
     const ep = state.endPortal;
     if (!ep) return;
     if (bot.entity.position.y > ep.y + 8) {
