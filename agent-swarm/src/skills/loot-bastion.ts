@@ -166,7 +166,7 @@ export async function marchToward(
     position?: Vec3;
   }) => (b?.position ? dangerCost(dimKey(bot.game?.dimension), b.position) : 0)) as unknown as (b: never) => number);
   (marchMoves as unknown as { canDig: boolean }).canDig = true;
-  (marchMoves as unknown as { allow1by1towers: boolean }).allow1by1towers = true;
+  (marchMoves as unknown as { allow1by1towers: boolean }).allow1by1towers = !String(bot.game?.dimension ?? "").includes("nether");
   (marchMoves as unknown as { maxDropDown: number }).maxDropDown = 3;
   (marchMoves as unknown as { allowParkour: boolean }).allowParkour = false;
   // Run 749: all three of Mason's deaths were "tried to swim in lava" at

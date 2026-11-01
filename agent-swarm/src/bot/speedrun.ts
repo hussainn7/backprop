@@ -379,7 +379,7 @@ function moves(bot: Bot, dig: boolean) {
   const m = baseMoves(bot);
   const mm = m as unknown as { canDig: boolean; allow1by1towers: boolean; allowParkour: boolean };
   mm.canDig = dig;
-  mm.allow1by1towers = true;
+  mm.allow1by1towers = !inNether(bot); // a missed tower block in the Nether is a fall into lava
   mm.allowParkour = false;
   return m;
 }
@@ -497,6 +497,18 @@ const FOES = new Set([
   "vindicator",
   "phantom",
 ]);
+
+const hurtAt = new Map<string, number>();
+
+/**
+ * Awareness: long actions (stairs, pillars, walks) must notice when something is hitting the
+ * bot. If health dropped in the last few seconds, fight what is close; eat when low.
+ */
+async function guard(bot: Bot): Promise<void> {
+  if (!bot.entity || bot.health <= 0) return;
+  if (Date.now() - (hurtAt.get(bot.username) ?? 0) < 4000) await defend(bot, 7);
+  if (bot.health <= 9) await topUp(bot);
+}
 
 /** Fight off whatever hostile is within `radius` (bounded to 15 s). */
 async function defend(bot: Bot, radius: number): Promise<number> {
@@ -1394,6 +1406,7 @@ async function descendTo(bot: Bot, targetY: number): Promise<boolean> {
       break;
     }
     await sleep(10);
+    await guard(bot);
     const p = bot.entity.position.floored();
     const [dx, dz] = SPIRAL[i % SPIRAL.length];
     const ahead = p.offset(dx, 0, dz);
@@ -1501,6 +1514,7 @@ async function swimOutOfLava(bot: Bot, to: { x: number; z: number }, targetY: nu
  * to open a headroom cell that is lava; digs a solid ceiling out of the way.
  */
 async function pillarUp(bot: Bot, targetY: number): Promise<boolean> {
+  if (inNether(bot)) return false; // a missed block over the lava sea means a fall to the bottom
   const until = Date.now() + 90_000;
   let placed = 0;
   const no = (why: string) => {
@@ -1510,6 +1524,7 @@ async function pillarUp(bot: Bot, targetY: number): Promise<boolean> {
   doing(bot, `pillaring up to y=${targetY}`);
   try {
     while (bot.entity && bot.entity.position.y < targetY - 1 && Date.now() < until && currentMode() === "game") {
+      await guard(bot);
       const p = bot.entity.position.floored();
       for (const dy of [2, 3]) {
         const b = bot.blockAt(p.offset(0, dy, 0));
@@ -1557,6 +1572,7 @@ async function ascendTo(bot: Bot, targetY: number, to?: { x: number; z: number }
       break;
     }
     await sleep(10); // always yield: a spin here froze the whole process (millions of iterations)
+    await guard(bot);
     const p = bot.entity.position.floored();
     // Pick any side with solid ground to climb onto (nearest to the destination first): a wall
     // may be on any side, and a fixed rotation tried the wrong sides while the right one waited.
@@ -2008,6 +2024,7 @@ async function step(bot: Bot): Promise<void> {
   // The overworld half of the route is run by the captain (the leader when it is there).
   const lead = ["home", "eyes", "stronghold", "fill"].includes(state.phase) ? captain() : leader();
   const idx = Math.max(0, order(me));
+  await guard(bot);
   syncShared();
   // Someone opened a portal already: no eyes, rods or stronghold needed, go straight to it.
   const open = sharedPortal();
@@ -2245,6 +2262,11 @@ async function step(bot: Bot): Promise<void> {
 export function startSpeedrun(bot: Bot, brain: Pausable): void {
   if (process.env.SPEEDRUN_DIRECTOR !== "true") return;
   captureChat(bot);
+  let lastHp = 20;
+  bot.on("health", () => {
+    if (bot.health < lastHp - 0.5) hurtAt.set(bot.username, Date.now());
+    lastHp = bot.health;
+  });
   // Lava guard: lava killed bots in overworld caves as well as the Nether. Whenever lava is
   // within a few blocks and no fire resistance is active, eat for it before stepping closer.
   const lavaTimer = setInterval(() => {

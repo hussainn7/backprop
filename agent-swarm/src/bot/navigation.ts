@@ -169,7 +169,12 @@ export function baseMoves(bot: Bot): InstanceType<typeof Movements> {
   // into the lava sea on three days; the fortress sweep's own cap never
   // applied because every walk builds its moves here. In the Nether a
   // drop is a stair or a cliff over lava: two blocks, no more.
-  if (String(bot.game?.dimension ?? "").includes("nether")) moves.maxDropDown = 2;
+  if (String(bot.game?.dimension ?? "").includes("nether")) {
+    moves.maxDropDown = 2;
+    // No placing in the Nether: a bridge or tower block that misses is a fall into the lava sea,
+    // and bots then spent hours swimming up from the bottom. Dig and walk existing ground only.
+    moves.scafoldingBlocks.length = 0;
+  }
   // Run 683: the farm baked 24 bread in an hour and its two bakers ate 18 of
   // them at 0 to 11 hunger, sprinting everywhere in between. Walking costs
   // no hunger; sprinting costs one point per 40 blocks and sprint-jumps four
