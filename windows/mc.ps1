@@ -2,9 +2,11 @@
 #   .\mc.ps1 status | start | stop | restart [server|agents|alpha|bravo] | logs [server|alpha|bravo]
 #   .\mc.ps1 console "<cmd>" ...     .\mc.ps1 budget     .\mc.ps1 check (hunt guardian: every bot's state)
 # Paper listens on 127.0.0.1:25565 only (offline mode, whitelist on); bots join it directly.
-# Ten bots run as two squads of five, one Node process each (one thread cannot path-find
-# for ten): alpha = Atlas (leader), Flora, Forge, Mason, Blade; Mission Control :3010
-#           bravo = Nova (leader), Ivy, Anvil, Brick, Fang;     Mission Control :3011
+# Twenty bots run as four squads of five, one Node process each (one thread cannot
+# path-find for more): alpha = Atlas (leader), Flora, Forge, Mason, Blade   Mission Control :3010
+#                      bravo = Nova (leader), Ivy, Anvil, Brick, Fang       :3011
+#                    charlie = Orion (leader), Sage, Ember, Stone, Viper    :3012
+#                      delta = Rex (leader), Willow, Cinder, Granite, Raven :3013
 # Each piece runs as a hidden PowerShell loop that restarts it if it exits.
 param([Parameter(Position = 0)][string]$Cmd = 'status', [Parameter(Position = 1, ValueFromRemainingArguments)][string[]]$Rest)
 $ErrorActionPreference = 'Stop'
@@ -13,7 +15,8 @@ $Root = Split-Path $PSScriptRoot -Parent
 $Server = Join-Path $Root 'server'
 $Swarm = Join-Path $Root 'agent-swarm'
 $Logs = Join-Path $Root 'logs'
-$Squads = @{ alpha = 3010; bravo = 3011 } # squad -> Mission Control port
+$Squads = [ordered]@{ alpha = 3010; bravo = 3011; charlie = 3012; delta = 3013 } # squad -> Mission Control port
+$SquadNames = @($Squads.Keys)
 New-Item -ItemType Directory -Force $Logs | Out-Null
 
 function Java {
@@ -25,7 +28,7 @@ function Java {
 function Rcon([string[]]$cmds) { & node (Join-Path $Swarm 'scripts\rcon.mjs') @cmds 2>$null | ForEach-Object { $_ -replace '[^\u0000-\u007F]+[0-9a-fk-or]', '' } | Where-Object { $_ -notmatch '^>' } }
 function Pieces($names) {
     $out = @()
-    foreach ($n in $names) { if ($n -eq 'agents') { $out += 'alpha', 'bravo' } else { $out += $n } }
+    foreach ($n in $names) { if ($n -eq 'agents') { $out += $SquadNames } else { $out += $n } }
     $out
 }
 function Loops($piece) {
@@ -86,22 +89,21 @@ switch ($Cmd) {
             Start-Sleep 10
         }
     }
-    '_run-alpha' { RunSquad alpha }
-    '_run-bravo' { RunSquad bravo }
-    'start' { foreach ($p in 'server', 'alpha', 'bravo') { Launch $p } }
-    'stop' { foreach ($p in 'alpha', 'bravo', 'server') { Halt $p } }
+    { $_ -like '_run-*' -and $SquadNames -contains $_.Substring(5) } { RunSquad $_.Substring(5) }
+    'start' { foreach ($p in @('server') + $SquadNames) { Launch $p } }
+    'stop' { foreach ($p in $SquadNames + @('server')) { Halt $p } }
     'restart' {
-        $pieces = if ($Rest) { Pieces $Rest } else { @('alpha', 'bravo', 'server') }
+        $pieces = if ($Rest) { Pieces $Rest } else { $SquadNames + @('server') }
         foreach ($p in $pieces) { Halt $p }
-        foreach ($p in 'server', 'alpha', 'bravo') { if ($pieces -contains $p) { Launch $p } } # server before agents
+        foreach ($p in @('server') + $SquadNames) { if ($pieces -contains $p) { Launch $p } } # server before agents
     }
     'status' {
-        foreach ($p in 'server', 'alpha', 'bravo') { '{0,-8} {1}' -f $p, $(if (Children $p) { 'running' } elseif (Loops $p) { 'starting' } else { 'stopped' }) }
+        foreach ($p in @('server') + $SquadNames) { '{0,-8} {1}' -f $p, $(if (Children $p) { 'running' } elseif (Loops $p) { 'starting' } else { 'stopped' }) }
         if (PortOpen 25565) { Rcon @('tps', 'list') } else { '(server port closed)' }
     }
     'check' {
         # Hunt guardian report: every bot's state, distance to the target, movement, rescues.
-        foreach ($s in 'alpha', 'bravo') {
+        foreach ($s in $SquadNames) {
             $f = Join-Path $Swarm "logs\guardian-$s.json"
             if (-not (Test-Path $f)) { "${s}: no guardian report yet (hunt mode off, or target not in survival)"; continue }
             $g = Get-Content $f -Raw | ConvertFrom-Json
@@ -115,7 +117,7 @@ switch ($Cmd) {
     'logs' { $p = if ($Rest) { $Rest[0] } else { 'alpha' }; Get-Content (Join-Path $Logs "$(LogName $p).log") -Tail 80 -Wait }
     'console' { Rcon $Rest }
     'budget' {
-        foreach ($s in 'alpha', 'bravo') {
+        foreach ($s in $SquadNames) {
             $f = Join-Path $Swarm $(if ($s -eq 'alpha') { 'logs\api-usage.json' } else { "logs\api-usage-$s.json" })
             if (-not (Test-Path $f)) { "${s}: no API usage recorded yet"; continue }
             $d = Get-Content $f -Raw | ConvertFrom-Json

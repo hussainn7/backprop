@@ -1,36 +1,49 @@
 // src/bot/squad.ts
 //
-// Two squads of five, one Node process each (one thread cannot path-find for
-// ten bots). SQUAD=alpha runs Atlas, Flora, Forge, Mason, Blade; SQUAD=bravo
-// runs the same five roles as Nova, Ivy, Anvil, Brick, Fang. Role behaviour
-// throughout the code is keyed by archetype (the alpha name), so a bravo bot
-// behaves exactly like its alpha counterpart.
+// Squads of five, one Node process each (one thread cannot path-find for more).
+// Every squad plays the same five roles under its own names; role behaviour
+// throughout the code is keyed by archetype (the alpha name), so any squad's
+// bot behaves exactly like its alpha counterpart. Add a squad by adding a row.
 //
-// The explorer of each squad (Atlas / Nova) is its leader: the others stay
-// within SQUAD_RADIUS of it and see its latest plan in their prompts.
+// The explorer of each squad (its Atlas) is its leader: the others stay within
+// SQUAD_RADIUS of it and see its latest plan in their prompts.
 
 import type { Bot } from "mineflayer";
 
 export type Archetype = "Atlas" | "Flora" | "Forge" | "Mason" | "Blade";
 export const ARCHETYPES: Archetype[] = ["Atlas", "Flora", "Forge", "Mason", "Blade"];
 
-const BRAVO: Record<Archetype, string> = { Atlas: "Nova", Flora: "Ivy", Forge: "Anvil", Mason: "Brick", Blade: "Fang" };
+/** Squad → its names for the five roles, in ARCHETYPES order. */
+export const SQUADS: Record<string, Record<Archetype, string>> = {
+  alpha: { Atlas: "Atlas", Flora: "Flora", Forge: "Forge", Mason: "Mason", Blade: "Blade" },
+  bravo: { Atlas: "Nova", Flora: "Ivy", Forge: "Anvil", Mason: "Brick", Blade: "Fang" },
+  charlie: { Atlas: "Orion", Flora: "Sage", Forge: "Ember", Mason: "Stone", Blade: "Viper" },
+  delta: { Atlas: "Rex", Flora: "Willow", Forge: "Cinder", Mason: "Granite", Blade: "Raven" },
+};
+export const SQUAD_NAMES = Object.keys(SQUADS);
 
-export const SQUAD = (process.env.SQUAD || "alpha").toLowerCase() === "bravo" ? "bravo" : "alpha";
+const requested = (process.env.SQUAD || "alpha").toLowerCase();
+export const SQUAD = SQUADS[requested] ? requested : "alpha";
 
-/** Every bot name in both squads, so neither treats the other as a human. */
-export const ALL_BOT_NAMES: string[] = [...ARCHETYPES, ...ARCHETYPES.map((a) => BRAVO[a])];
+/** Index of a squad (0 = alpha): offsets its ports and the like. */
+export const squadIndex = (squad = SQUAD): number => Math.max(0, SQUAD_NAMES.indexOf(squad));
+
+/** Every bot name in every squad, so none treats another as a human. */
+export const ALL_BOT_NAMES: string[] = SQUAD_NAMES.flatMap((sq) => ARCHETYPES.map((a) => SQUADS[sq][a]));
 
 /** This squad's name for an archetype ("Blade" → "Fang" in bravo). */
 export function squadName(archetype: Archetype, squad = SQUAD): string {
-  return squad === "bravo" ? BRAVO[archetype] : archetype;
+  return (SQUADS[squad] ?? SQUADS.alpha)[archetype];
 }
 
 /** The role a bot plays, whichever squad it is in ("Fang" → "Blade"). Unknown names pass through. */
 export function archetypeOf(username: string | undefined): string {
   if (!username) return "";
-  const hit = ARCHETYPES.find((a) => BRAVO[a] === username);
-  return hit ?? username;
+  for (const sq of SQUAD_NAMES) {
+    const hit = ARCHETYPES.find((a) => SQUADS[sq][a] === username);
+    if (hit) return hit;
+  }
+  return username;
 }
 
 export const leaderName = (): string => squadName("Atlas");

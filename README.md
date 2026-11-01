@@ -240,12 +240,12 @@ offline mode is safe. Bots join Paper directly (`MC_PORT=25565`).
 * `windows\mc.ps1 status|start|stop|restart [server|agents]|logs [server|agents]|console|budget`
   is the `./mc` counterpart; logs go to `logs\server.log` and `logsgents.log`.
   `windows\install-autostart.ps1` runs `mc.ps1 start` at login.
-* **Ten bots, two squads.** One Node thread cannot path-find for ten bots, so they run as
-  two processes (`SQUAD=alpha|bravo`, see `src/bot/squad.ts`): alpha = Atlas (leader),
-  Flora, Forge, Mason, Blade (Mission Control :3010); bravo = Nova (leader), Ivy, Anvil,
-  Brick, Fang (:3011), playing the same five roles. Members regroup when more than
-  `SQUAD_RADIUS` blocks from their leader and see the leader's latest plan in their prompts.
-  Each squad has its own spend ledger (`logs/api-usage[-bravo].json`) and caps.
+* **Twenty bots, four squads.** One Node thread cannot path-find for more than five bots,
+  so each squad is its own process (`SQUAD=alpha|bravo|charlie|delta`, see `src/bot/squad.ts`):
+  alpha = Atlas, Flora, Forge, Mason, Blade (:3010); bravo = Nova, Ivy, Anvil, Brick, Fang (:3011);
+  charlie = Orion, Sage, Ember, Stone, Viper (:3012); delta = Rex, Willow, Cinder, Granite, Raven
+  (:3013). Each plays the same five roles, has its own leader, spend ledger and caps.
+  `KIT_BOTS` (`src/bot/kit.ts`) gives listed bots a full enchanted netherite loadout and re-applies it if lost.
 * **Speedrun + hunt.** `TEAM_GOAL` carries the speedrun route; `HUNT_PLAYER=SirFinnn` lets
   bots attack that one player, only while he is in survival mode. Hostile sounds (a fusing
   creeper, a skeleton out of sight) trigger the reflex layer immediately.

@@ -42,7 +42,7 @@ interface Tracked {
 let tracked: Tracked | null = null;
 let trackerStarted = false;
 
-function rconSettings(): { port: number; password: string } | null {
+export function rconSettings(): { port: number; password: string } | null {
   try {
     const props = fs.readFileSync(path.join("server", "server.properties"), "utf8");
     const password = props.match(/^rcon\.password=(.*)$/m)?.[1]?.trim();
