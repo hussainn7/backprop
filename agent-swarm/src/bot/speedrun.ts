@@ -1473,7 +1473,9 @@ async function strongholdLeg(bot: Bot): Promise<void> {
   // stronghold is known must the portal's 12 be protected. Reserving 12 from the start made a
   // squad with exactly 12 eyes unable to throw even one.
   const reserve = est ? PORTAL_EYES : 8;
-  const mayThrow = eyes > 0 && (squadEyes > reserve || (!!est && flat(me, est) < 32));
+  // Once an eye has dived the position is exact: more throws only break eyes (20% each) that the
+  // portal needs, and kept re-announcing the same dive.
+  const mayThrow = eyes > 0 && !est?.exact && (squadEyes > reserve || (!!est && flat(me, est) < 32));
   if (mayThrow) {
     const r = await throwEye(bot);
     if (r) {
