@@ -1136,8 +1136,11 @@ async function fightBlaze(bot: Bot, blaze: Entity): Promise<void> {
 async function huntBlazes(bot: Bot): Promise<void> {
   doing(bot, "hunting blazes");
   const f = state.fortress!;
-  if (flat(bot.entity.position, f) > 48) {
-    await march(bot, f, 120_000, () => flat(bot.entity.position, f) < 24 || squadCount("blaze_rod") >= state.rodTarget);
+  // Known spawner: go straight to it instead of wandering the fortress.
+  const goal = state.spawner ?? f;
+  if (flat(bot.entity.position, goal) > (state.spawner ? 24 : 48)) {
+    if (state.spawner) await talk(bot, "spawner", `Going straight to the blaze spawner at ${state.spawner.x} ${state.spawner.y} ${state.spawner.z}`, 120_000);
+    await march(bot, goal, 120_000, () => flat(bot.entity.position, goal) < (state.spawner ? 12 : 24) || squadCount("blaze_rod") >= state.rodTarget);
     return;
   }
   // Under the fortress (the lava sea is at y=31, bridges near y=60): climb to its height first.
@@ -1514,7 +1517,6 @@ async function swimOutOfLava(bot: Bot, to: { x: number; z: number }, targetY: nu
  * to open a headroom cell that is lava; digs a solid ceiling out of the way.
  */
 async function pillarUp(bot: Bot, targetY: number): Promise<boolean> {
-  if (inNether(bot)) return false; // a missed block over the lava sea means a fall to the bottom
   const until = Date.now() + 90_000;
   let placed = 0;
   const no = (why: string) => {
@@ -1543,13 +1545,31 @@ async function pillarUp(bot: Bot, targetY: number): Promise<boolean> {
       if (!support || support.boundingBox !== "block") return no(`no support under ${p} (${support?.name})`);
       bot.pathfinder.setGoal(null);
       await bot.look(bot.entity.yaw, -Math.PI / 2, true).catch(() => {});
-      bot.setControlState("jump", true);
-      const t = Date.now();
-      while (Date.now() - t < 700 && bot.entity.position.y < p.y + 1.05) await sleep(30);
-      await bot.placeBlock(support, new Vec3(0, 1, 0)).catch(() => {});
-      bot.setControlState("jump", false);
-      await sleep(150);
-      if (bot.entity.position.y < p.y + 0.5) return no(`did not rise at ${p} (y=${bot.entity.position.y.toFixed(2)})`);
+      // Solid placement: centre on the column first (a drifting bot misses the face), jump, place
+      // the moment the feet clear the old top, and verify the block is really there; retry once.
+      const cx = p.x + 0.5;
+      const cz = p.z + 0.5;
+      for (let k = 0; k < 6 && Math.hypot(bot.entity.position.x - cx, bot.entity.position.z - cz) > 0.18; k++) {
+        await bot.lookAt(new Vec3(cx, bot.entity.position.y, cz), true).catch(() => {});
+        bot.setControlState("forward", true);
+        await sleep(45);
+        bot.setControlState("forward", false);
+        await sleep(60);
+      }
+      await bot.look(bot.entity.yaw, -Math.PI / 2, true).catch(() => {});
+      let landed = false;
+      for (let attempt = 0; attempt < 2 && !landed; attempt++) {
+        bot.setControlState("jump", true);
+        const t = Date.now();
+        while (Date.now() - t < 700 && bot.entity.position.y < p.y + 1.02) await sleep(25);
+        await bot.placeBlock(support, new Vec3(0, 1, 0)).catch(() => {});
+        bot.setControlState("jump", false);
+        await sleep(120);
+        landed = bot.blockAt(p)?.boundingBox === "block";
+        if (!landed) await sleep(200); // let the fall finish before the retry
+        if (bot.entity.position.y < p.y - 0.4) break; // dropped off: the stair/swim logic takes over
+      }
+      if (!landed) return no(`placement missed at ${p} (y=${bot.entity.position.y.toFixed(2)})`);
       placed++;
     }
     return !!bot.entity && bot.entity.position.y >= targetY - 1;
@@ -2267,6 +2287,57 @@ export function startSpeedrun(bot: Bot, brain: Pausable): void {
     if (bot.health < lastHp - 0.5) hurtAt.set(bot.username, Date.now());
     lastHp = bot.health;
   });
+  // Projectile dodge: blaze fireballs, ghast fireballs and arrows that are flying at this bot.
+  const seen = new Map<number, { p: Vec3; at: number }>();
+  let dodging = false;
+  const dodgeTimer = setInterval(() => {
+    if (dodging || !bot.entity || bot.health <= 0 || currentMode() !== "game") return;
+    const me = bot.entity.position.offset(0, 1, 0);
+    const now = Date.now();
+    for (const e of Object.values(bot.entities)) {
+      if (!e.isValid || !/^(small_fireball|fireball|dragon_fireball|arrow|spectral_arrow|wither_skull)$/.test(e.name ?? "")) continue;
+      const d = e.position.distanceTo(me);
+      const prev = seen.get(e.id);
+      seen.set(e.id, { p: e.position.clone(), at: now });
+      if (!prev || d > 16 || now - prev.at > 400) continue;
+      const v = e.position.minus(prev.p).scaled(1000 / Math.max(30, now - prev.at)); // blocks per second
+      const speed = v.norm();
+      if (speed < 3) continue;
+      const toMe = me.minus(e.position);
+      const closing = (v.x * toMe.x + v.y * toMe.y + v.z * toMe.z) / (speed * Math.max(0.1, toMe.norm()));
+      if (closing < 0.93) continue; // not headed at us
+      const eta = d / speed;
+      if (eta > 0.9 || eta < 0.08) continue;
+      // Sidestep perpendicular to its flight, away from the lava/void side if we can tell.
+      const dir = new Vec3(v.x / speed, 0, v.z / speed);
+      const side = new Vec3(-dir.z, 0, dir.x);
+      const left = bot.entity.position.offset(side.x * 2, 0, side.z * 2);
+      const right = bot.entity.position.offset(-side.x * 2, 0, -side.z * 2);
+      const safe = (q: Vec3) => {
+        const f = bot.blockAt(q.floored().offset(0, -1, 0));
+        const here = bot.blockAt(q.floored());
+        return f?.boundingBox === "block" && !/lava/.test(here?.name ?? "") && !/lava/.test(f?.name ?? "");
+      };
+      const pick = safe(left) ? side : safe(right) ? side.scaled(-1) : null;
+      if (!pick) continue;
+      dodging = true;
+      void (async () => {
+        try {
+          bot.pathfinder.setGoal(null);
+          await bot.lookAt(bot.entity.position.offset(pick.x * 3, 1.6, pick.z * 3), true).catch(() => {});
+          bot.setControlState("forward", true);
+          bot.setControlState("sprint", true);
+          await sleep(320);
+        } finally {
+          bot.clearControlStates();
+          dodging = false;
+        }
+      })();
+      return;
+    }
+    if (seen.size > 80) for (const [id, v2] of seen) if (now - v2.at > 2000) seen.delete(id);
+  }, 60);
+  bot.once("end", () => clearInterval(dodgeTimer));
   // Lava guard: lava killed bots in overworld caves as well as the Nether. Whenever lava is
   // within a few blocks and no fire resistance is active, eat for it before stepping closer.
   const lavaTimer = setInterval(() => {
