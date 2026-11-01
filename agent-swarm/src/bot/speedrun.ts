@@ -1358,9 +1358,11 @@ const HAZARD = /lava|magma|fire|spawner/; // water is only an obstacle; lava kil
 
 /** True when digging at `c` (and standing there) is safe: no liquids around, solid floor below. */
 function cellSafe(bot: Bot, c: Vec3): boolean {
+  // With fire resistance active, lava (and fire) beside the stair is harmless: only spawners matter.
+  const bad = hasFireResistance(bot) ? /spawner/ : HAZARD;
   for (const [dx, dy, dz] of [[0, 0, 0], [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]) {
     const n = bot.blockAt(c.offset(dx, dy, dz))?.name ?? "unknown";
-    if (HAZARD.test(n)) return false;
+    if (bad.test(n)) return false;
   }
   // Falling blocks above would bury the bot as soon as the support is dug out.
   const above = bot.blockAt(c.offset(0, 2, 0))?.name ?? "";
