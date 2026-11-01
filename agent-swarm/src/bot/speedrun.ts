@@ -205,8 +205,34 @@ export function raceSnapshot() {
   };
 }
 
+// An open End portal is open for everyone: squads share it so none walks to its own.
+const SHARED_PORTAL = path.join("logs", "shared-end-portal.json");
+function shareOpenPortal(p: XYZ): void {
+  try {
+    if (fs.existsSync(SHARED_PORTAL)) return;
+    fs.mkdirSync(path.dirname(SHARED_PORTAL), { recursive: true });
+    fs.writeFileSync(SHARED_PORTAL, JSON.stringify({ ...p, by: SQUAD, at: new Date().toISOString() }));
+  } catch {
+    /* best effort */
+  }
+}
+let sharedCache: { at: number; p: XYZ | null } = { at: 0, p: null };
+function sharedPortal(): XYZ | null {
+  if (Date.now() - sharedCache.at < 5000) return sharedCache.p;
+  let p: XYZ | null = null;
+  try {
+    const j = JSON.parse(fs.readFileSync(SHARED_PORTAL, "utf8"));
+    if (typeof j.x === "number" && typeof j.z === "number") p = { x: j.x, y: j.y, z: j.z };
+  } catch {
+    /* none yet */
+  }
+  sharedCache = { at: Date.now(), p };
+  return p;
+}
+
 function setPhase(next: Phase, why: string): void {
   if (state.phase === next) return;
+  if (next === "end" && state.endPortal) shareOpenPortal(state.endPortal);
   state.phase = next;
   state.splits[next] = new Date().toISOString();
   save();
@@ -1558,6 +1584,13 @@ async function step(bot: Bot): Promise<void> {
   // The overworld half of the route is run by the captain (the leader when it is there).
   const lead = ["home", "eyes", "stronghold", "fill"].includes(state.phase) ? captain() : leader();
   const idx = Math.max(0, order(me));
+  // Someone opened a portal already: no eyes, rods or stronghold needed, go straight to it.
+  const open = sharedPortal();
+  if (open && PHASES.indexOf(state.phase) < PHASES.indexOf("end")) {
+    state.endPortal = open;
+    save();
+    setPhase("end", `an End portal is already open at ${open.x} ${open.y} ${open.z}; joining it`);
+  }
   switch (state.phase) {
     case "portal": {
       if (!inOverworld(bot)) {
@@ -1777,6 +1810,7 @@ async function step(bot: Bot): Promise<void> {
 export function startSpeedrun(bot: Bot, brain: Pausable): void {
   if (process.env.SPEEDRUN_DIRECTOR !== "true") return;
   captureChat(bot);
+  if (state.endPortal && ["end", "dragon", "done"].includes(state.phase)) shareOpenPortal(state.endPortal);
   void import("../stream/race.js")
     .then(({ startRaceServers }) => startRaceServers(raceSnapshot))
     .catch((e) => console.warn(`[Race] ${(e as Error).message}`));
