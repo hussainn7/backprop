@@ -1166,7 +1166,7 @@ const heading = new Map<string, number>();
 function seeBricks(bot: Bot): Vec3 | null {
   const id = bot.registry.blocksByName.nether_bricks?.id;
   if (id === undefined) return null;
-  return bot.findBlock({ matching: id, maxDistance: 96 })?.position ?? null;
+  return throttled(`bricks:${bot.username}`, 4000, () => bot.findBlock({ matching: id, maxDistance: 96 })?.position ?? null);
 }
 
 async function searchFortress(bot: Bot, index: number): Promise<void> {
@@ -1266,7 +1266,7 @@ async function huntBlazes(bot: Bot): Promise<void> {
   await pickUpNear(bot, ["blaze_rod"], 24, 8000);
   if (!state.spawner) {
     const id = bot.registry.blocksByName.spawner?.id;
-    const sp = id !== undefined ? bot.findBlock({ matching: id, maxDistance: 128 }) : null;
+    const sp = id !== undefined ? throttled(`spawner:${bot.username}`, 8000, () => bot.findBlock({ matching: id, maxDistance: 128 })) : null;
     if (sp) {
       // Blaze spawners stand on raised brick platforms; other spawners in a fortress do not exist.
       state.spawner = { x: sp.position.x, y: sp.position.y, z: sp.position.z };
@@ -1390,10 +1390,31 @@ async function throwEye(bot: Bot): Promise<EyeReading | null> {
   return { dx: (b.x - a.x) / len, dz: (b.z - a.z) / len, descended, end: b };
 }
 
+/** Run an expensive search at most once per `ttlMs` per key; reuse the last answer in between. */
+const searchCache = new Map<string, { at: number; v: unknown }>();
+function throttled<T>(key: string, ttlMs: number, fn: () => T): T {
+  const hit = searchCache.get(key);
+  if (hit && Date.now() - hit.at < ttlMs) return hit.v as T;
+  const v = fn();
+  searchCache.set(key, { at: Date.now(), v });
+  return v;
+}
+
+// A 128-block findBlocks scans millions of blocks and blocks the whole process (event-loop stalls
+// of 5-10 s in the stronghold stage, 5 bots x once a second). Cache per bot and radius for a while;
+// the frames do not move, and a miss only needs re-checking as the bot walks or digs closer.
+const frameCache = new Map<string, { at: number; from: Vec3; res: Vec3[] }>();
 function findFrames(bot: Bot, radius = 128): Vec3[] {
   const id = bot.registry.blocksByName.end_portal_frame?.id;
   if (id === undefined) return [];
-  return bot.findBlocks({ matching: id, maxDistance: radius, count: 12 });
+  const key = `${bot.username}:${radius}`;
+  const hit = frameCache.get(key);
+  const here = bot.entity.position;
+  const ttl = radius > 64 ? 6000 : 2000;
+  if (hit && Date.now() - hit.at < ttl && hit.from.distanceTo(here) < 12) return hit.res;
+  const res = bot.findBlocks({ matching: id, maxDistance: radius, count: 12 });
+  frameCache.set(key, { at: Date.now(), from: here.clone(), res });
+  return res;
 }
 const frameHasEye = (bot: Bot, p: Vec3) => {
   const props = bot.blockAt(p)?.getProperties() as Record<string, unknown> | undefined;
@@ -1924,7 +1945,7 @@ async function jumpIn(bot: Bot): Promise<void> {
 function exitPortalOpen(bot: Bot): boolean {
   const id = bot.registry.blocksByName.end_portal?.id;
   if (id === undefined) return false;
-  const b = bot.findBlock({ matching: id, maxDistance: 160 });
+  const b = throttled(`exit:${bot.username}`, 5000, () => bot.findBlock({ matching: id, maxDistance: 160 }));
   return !!b && Math.hypot(b.position.x, b.position.z) < 8;
 }
 
