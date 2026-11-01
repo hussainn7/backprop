@@ -1494,17 +1494,21 @@ async function swimOutOfLava(bot: Bot, to: { x: number; z: number }, targetY: nu
 async function pillarUp(bot: Bot, targetY: number): Promise<boolean> {
   const until = Date.now() + 90_000;
   let placed = 0;
+  const no = (why: string) => {
+    console.log(`[Speedrun] ${bot.username}: pillar stopped: ${why}`);
+    return false;
+  };
   doing(bot, `pillaring up to y=${targetY}`);
   try {
     while (bot.entity && bot.entity.position.y < targetY - 1 && Date.now() < until && currentMode() === "game") {
       const p = bot.entity.position.floored();
       for (const dy of [2, 3]) {
         const b = bot.blockAt(p.offset(0, dy, 0));
-        if (!b || HAZARD.test(b.name)) return false;
+        if (!b || HAZARD.test(b.name)) return no(`headroom ${dy} is ${b?.name}`);
         if (b.boundingBox === "block") {
           await equip(bot, "netherite_pickaxe");
           await bot.dig(b, true).catch(() => {});
-          if (bot.blockAt(p.offset(0, dy, 0))?.boundingBox === "block") return false;
+          if (bot.blockAt(p.offset(0, dy, 0))?.boundingBox === "block") return no(`cannot dig headroom ${dy}`);
         }
       }
       if (!(await equip(bot, "cobblestone"))) {
@@ -1512,7 +1516,7 @@ async function pillarUp(bot: Bot, targetY: number): Promise<boolean> {
         return false;
       }
       const support = bot.blockAt(p.offset(0, -1, 0));
-      if (!support || support.boundingBox !== "block") return false;
+      if (!support || support.boundingBox !== "block") return no(`no support under ${p} (${support?.name})`);
       bot.pathfinder.setGoal(null);
       await bot.look(bot.entity.yaw, -Math.PI / 2, true).catch(() => {});
       bot.setControlState("jump", true);
@@ -1521,7 +1525,7 @@ async function pillarUp(bot: Bot, targetY: number): Promise<boolean> {
       await bot.placeBlock(support, new Vec3(0, 1, 0)).catch(() => {});
       bot.setControlState("jump", false);
       await sleep(150);
-      if (bot.entity.position.y < p.y + 0.5) return false;
+      if (bot.entity.position.y < p.y + 0.5) return no(`did not rise at ${p} (y=${bot.entity.position.y.toFixed(2)})`);
       placed++;
     }
     return !!bot.entity && bot.entity.position.y >= targetY - 1;
