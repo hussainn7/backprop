@@ -8,6 +8,12 @@
 //   stuck            moved < 2 blocks in 25 s, not fighting (> 20 blocks out):
 //                    teleport to a FREE teammate (moving or already near him,
 //                    healthy, closer to him than us); none free: lift to surface
+//   under his tower  within 8 blocks of him horizontally but 8+ below him: the
+//                    bot is climbing after him (it pillars with cobblestone);
+//                    never teleported, never counted as stuck
+//   too slow         > 120 blocks out and closed < 40 blocks in 25 s (e.g. just
+//                    respawned far away): teleport to a free teammate at least
+//                    twice as close, else drop on open ground 25 blocks from him
 //   check            the next cycles confirm the bot moves again; a bot rescued
 //                    twice in 2 min without moving is lifted near the best
 //                    teammate's position instead
@@ -28,6 +34,11 @@ const CYCLE_MS = 5000;
 const STUCK_MS = 25_000;
 const FIGHT_RANGE = 20;
 const RESCUE_COOLDOWN_MS = 20_000;
+// Too slow: far out and not closing fast enough (respawned 500 blocks away,
+// crawling over hills). Not stuck, but not going to arrive in time either.
+const FAR_RANGE = 120;
+const MIN_CLOSING = 40; // blocks closer per 25 s
+const DROP_RADIUS = 25; // put far bots this far from him, on their side
 
 interface Sample {
   pos: Vec3;
@@ -42,6 +53,8 @@ interface Track {
   status: string;
   /** Consecutive cycles found inside a block (2 = act: real suffocation persists). */
   walled: number;
+  /** Consecutive cycles spent under his tower. */
+  below: number;
 }
 
 const tracks = new Map<string, Track>();
@@ -113,7 +126,7 @@ export function startGuardian(): void {
         continue;
       }
       const hp = Number((await send(`data get entity ${name} Health`)).match(/: ([\d.]+)f/)?.[1] ?? 20);
-      const t = tracks.get(name) ?? { history: [], hp, lastRescueAt: 0, rescues: [], status: "", walled: 0 };
+      const t = tracks.get(name) ?? { history: [], hp, lastRescueAt: 0, rescues: [], status: "", walled: 0, below: 0 };
       t.history.push({ pos, at: now });
       while (t.history.length && now - t.history[0].at > 60_000) t.history.shift();
       t.hp = hp;
@@ -135,11 +148,28 @@ export function startGuardian(): void {
       const d = dist(name);
       const tracked = now - (t.history[0]?.at ?? now);
       const stuck = tracked >= STUCK_MS && moved(t, STUCK_MS, now) < 2 && d > FIGHT_RANGE;
+      const oldest = t.history.find((s) => now - s.at <= STUCK_MS);
+      const closing = oldest ? oldest.pos.distanceTo(him) - d : 0;
+      const slow = !stuck && tracked >= STUCK_MS && d > FAR_RANGE && closing < MIN_CLOSING;
       t.walled = inBlock(bot) ? t.walled + 1 : 0;
       const walled = t.walled >= 2;
-      t.status = walled ? "inside a block" : stuck ? "stuck" : d <= FIGHT_RANGE ? "fighting" : "chasing";
+      const here0 = t.history.at(-1)!.pos;
+      const underTower = Math.hypot(here0.x - him.x, here0.z - him.z) <= 8 && him.y - here0.y >= 8;
+      t.below = underTower ? t.below + 1 : 0;
+      const climbing = t.below >= 1;
+      t.status = walled
+        ? "inside a block"
+        : climbing
+          ? "climbing his tower"
+          : stuck
+            ? "stuck"
+            : slow
+              ? "too slow"
+              : d <= FIGHT_RANGE
+                ? "fighting"
+                : "chasing";
 
-      if ((walled || stuck) && now - t.lastRescueAt > RESCUE_COOLDOWN_MS) {
+      if ((walled || ((stuck || slow) && !climbing)) && now - t.lastRescueAt > RESCUE_COOLDOWN_MS) {
         t.lastRescueAt = now;
         t.rescues = t.rescues.filter((r) => now - r < 120_000);
         t.rescues.push(now);
@@ -147,9 +177,22 @@ export function startGuardian(): void {
         // Closest free teammate that is nearer to him than we are.
         const mate = ALL_BOT_NAMES.filter((n) => n !== name && isFree(n) && dist(n) < d).sort((a, b) => dist(a) - dist(b))[0];
         let action: string;
+        const nearMate = ALL_BOT_NAMES.filter((n) => n !== name && isFree(n) && dist(n) < d * 0.5).sort((a, b) => dist(a) - dist(b))[0];
         if (walled) {
           await send(`spreadplayers ${Math.floor(here.x)} ${Math.floor(here.z)} 0 1 false ${name}`);
           action = "lifted out of a block to the surface";
+        } else if (slow) {
+          if (nearMate) {
+            await send(`tp ${name} ${nearMate}`);
+            action = `too slow (${closing.toFixed(0)} blocks closer in 25 s): teleported to ${nearMate} (${dist(nearMate).toFixed(0)} blocks from ${target})`;
+          } else {
+            const away = here.minus(him);
+            const len = Math.hypot(away.x, away.z) || 1;
+            const p = him.plus(new Vec3((away.x / len) * DROP_RADIUS, 0, (away.z / len) * DROP_RADIUS));
+            await send(`spreadplayers ${Math.floor(p.x)} ${Math.floor(p.z)} 0 3 false ${name}`);
+            action = `too slow (${closing.toFixed(0)} blocks closer in 25 s): dropped ${DROP_RADIUS} blocks from ${target}`;
+          }
+          say(bot, "unstuck", `On my way back, ${target}!`, 30_000);
         } else if (mate && t.rescues.length < 3) {
           await send(`tp ${name} ${mate}`);
           action = `teleported to free teammate ${mate} (${dist(mate).toFixed(0)} blocks from ${target})`;
@@ -164,12 +207,13 @@ export function startGuardian(): void {
         t.history = [];
         t.walled = 0;
         t.status = `rescued: ${action}`;
-        console.log(`[Guardian] ${name} ${walled ? "was inside a block" : `stuck ${d.toFixed(0)} blocks from ${target}`}: ${action}`);
+        console.log(`[Guardian] ${name} ${walled ? "was inside a block" : `${slow ? "far" : "stuck"} ${d.toFixed(0)} blocks from ${target}`}: ${action}`);
       }
       report[name] = {
         status: t.status,
         distance: Math.round(d),
         moved25s: +moved(t, STUCK_MS, now).toFixed(1),
+        closed25s: Math.round(closing),
         hp: +t.hp.toFixed(1),
         rescuesLast2min: t.rescues.filter((r) => now - r < 120_000).length,
       };

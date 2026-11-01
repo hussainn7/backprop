@@ -145,6 +145,13 @@ export function startPearlTopup(botNames: string[]): void {
         await rcon.send(`give ${name} minecraft:ender_pearl ${16 - have}`);
         console.log(`[Pearls] topped up ${name}: ${have} -> 16`);
       }
+      // Scaffolding to pillar up to a target on a tower or hill.
+      for (const name of botNames) {
+        const reply: string = await rcon.send(`clear ${name} minecraft:cobblestone 0`);
+        const have = Number(reply.match(/Found (\d+) matching item/)?.[1] ?? (/No items were found/.test(reply) ? 0 : NaN));
+        if (Number.isNaN(have) || have >= 16) continue;
+        await rcon.send(`give ${name} minecraft:cobblestone ${64 - have}`);
+      }
       await rcon.end();
     } catch (err) {
       console.warn(`[Pearls] top-up pass failed: ${(err as Error).message}`);
