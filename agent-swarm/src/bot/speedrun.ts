@@ -1401,47 +1401,54 @@ function throttled<T>(key: string, ttlMs: number, fn: () => T): T {
   return v;
 }
 
-// End portal frames only exist inside a stronghold, so look only near the stronghold estimate (or the
-// known portal) and only in a small column around the bot. bot.findBlocks at 128 blocks cost ~5 s per
-// call and froze the whole process (5 bots x every second). This scan compares block-state numbers
-// directly (no Block objects) over a +-24 block square and every depth, ~0.1 s, and is shared by the
-// squad: the frames are a fact of the world, not of one bot.
-const frameScans = new Map<string, { at: number; res: Vec3[] }>();
-function findFrames(bot: Bot, _radius = 128): Vec3[] {
+// End portal frames only exist inside a stronghold. The point an eye dives at (and /locate reports) is the
+// stronghold's START, not its portal room, which can be 50-100 blocks away; but every chunk within the view
+// distance is already loaded, so a wide scan around that point finds the room without any exploring.
+// The scan compares raw block-state numbers (no Block objects) in small slices that yield between them,
+// so it cannot freeze the process (bot.findBlocks at 128 blocks blocked it for 5 s a call), and one result
+// is shared by the whole squad: the frames are a fact of the world, not of one bot.
+const frameScan = { running: false, at: 0, res: [] as Vec3[] };
+async function scanFramesAsync(bot: Bot, cx: number, cz: number): Promise<void> {
   const blk = bot.registry.blocksByName.end_portal_frame;
-  if (!blk) return [];
-  const centre = state.endPortal ?? (state.stronghold ? { x: state.stronghold.x, z: state.stronghold.z } : null);
-  if (!centre) return []; // nowhere sensible to look yet
-  const me = bot.entity.position;
-  if (flat(me, centre) > 90) return []; // frames only matter near the stronghold
-  const key = `${Math.round(me.x / 16)},${Math.round(me.z / 16)}`;
-  const hit = frameScans.get(key);
-  if (hit && Date.now() - hit.at < 4000) return hit.res;
-  const lo = blk.minStateId ?? blk.defaultState;
-  const hi = blk.maxStateId ?? blk.defaultState;
-  const world = bot.world as unknown as { getBlockStateId: (p: Vec3) => number | null | undefined };
-  const out: Vec3[] = [];
-  const p = new Vec3(0, 0, 0);
-  const R = 24;
-  scan: for (let x = Math.floor(me.x) - R; x <= me.x + R; x++)
-    for (let z = Math.floor(me.z) - R; z <= me.z + R; z++)
-      for (let y = -64; y <= 60; y++) {
-        p.x = x;
-        p.y = y;
-        p.z = z;
-        let st: number | null | undefined;
-        try {
-          st = world.getBlockStateId(p);
-        } catch {
-          st = 0;
-        }
-        if (typeof st === "number" && st >= lo && st <= hi) {
-          out.push(new Vec3(x, y, z));
-          if (out.length >= 12) break scan;
+  if (!blk) return;
+  frameScan.running = true;
+  try {
+    const lo = blk.minStateId ?? blk.defaultState;
+    const hi = blk.maxStateId ?? blk.defaultState;
+    const world = bot.world as unknown as { getBlockStateId: (p: Vec3) => number | null | undefined };
+    const out: Vec3[] = [];
+    const p = new Vec3(0, 0, 0);
+    const R = 96;
+    for (let x = Math.floor(cx) - R; x <= cx + R && out.length < 12; x++) {
+      for (let z = Math.floor(cz) - R; z <= cz + R; z++) {
+        for (let y = -64; y <= 60; y++) {
+          p.x = x;
+          p.y = y;
+          p.z = z;
+          let st: number | null | undefined;
+          try {
+            st = world.getBlockStateId(p);
+          } catch {
+            st = 0;
+          }
+          if (typeof st === "number" && st >= lo && st <= hi) out.push(new Vec3(x, y, z));
         }
       }
-  frameScans.set(key, { at: Date.now(), res: out });
-  return out;
+      if (x % 4 === 0) await sleep(0); // let the rest of the process run between slices
+    }
+    frameScan.res = out;
+    if (out.length) console.log(`[Speedrun] frame scan found ${out.length} End portal frames around ${Math.round(out[0].x)} ${out[0].y} ${Math.round(out[0].z)}`);
+  } finally {
+    frameScan.at = Date.now();
+    frameScan.running = false;
+  }
+}
+function findFrames(bot: Bot, _radius = 128): Vec3[] {
+  const centre = state.endPortal ?? (state.stronghold ? { x: state.stronghold.x, z: state.stronghold.z } : null);
+  if (!centre) return []; // nowhere sensible to look yet
+  if (flat(bot.entity.position, centre) > 120) return []; // outside the loaded area around it
+  if (!frameScan.running && Date.now() - frameScan.at > (frameScan.res.length ? 60_000 : 10_000)) void scanFramesAsync(bot, centre.x, centre.z);
+  return frameScan.res;
 }
 const frameHasEye = (bot: Bot, p: Vec3) => {
   const props = bot.blockAt(p)?.getProperties() as Record<string, unknown> | undefined;
