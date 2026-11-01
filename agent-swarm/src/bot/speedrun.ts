@@ -2268,7 +2268,6 @@ function disableBoats(why: string): void {
   }
 }
 const boating = new Set<string>();
-let boatFails = 0;
 const vehicleOf = (b: Bot): Entity | null => (b as unknown as { vehicle?: Entity | null }).vehicle ?? null;
 const lastBoat = new Map<string, number>();
 
@@ -2298,9 +2297,7 @@ async function boatTravel(bot: Bot, dest: Vec3): Promise<boolean> {
         .slice(0, 8)
         .join(" ");
       console.log(`[Speedrun] ${bot.username}: no boat appeared; entities within 8 blocks: ${near || "none"}`);
-      boatFails++;
-      if (boatFails >= 3) disableBoats("placing a boat did not produce a usable boat entity three times");
-      return false;
+      return false; // a failed placement (standing on shore, say) says nothing about whether boats work
     }
     bot.mount(boat);
     await sleep(600);
