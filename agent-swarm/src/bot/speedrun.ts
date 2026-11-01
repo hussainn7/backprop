@@ -1962,6 +1962,59 @@ async function fillPortal(bot: Bot): Promise<void> {
   if (findFrames(bot, 64).every((f) => frameHasEye(bot, f))) setPhase("end", "End portal is open. Everyone jump in!");
 }
 
+/**
+ * Enter the End portal from above: line up over its centre, dig down through whatever floor is under the
+ * feet (never the frames), and fall in. The pathfinder cannot reach the frames when the room's floor sits
+ * lower than the frames' platform, or when the bot arrives from the ceiling after digging down.
+ */
+async function dropIntoPortal(bot: Bot, cell: Vec3): Promise<boolean> {
+  const id = bot.registry.blocksByName.end_portal?.id;
+  if (id === undefined) return false;
+  const cells = bot.findBlocks({ matching: id, maxDistance: 5, count: 12, point: cell });
+  if (!cells.length) return false;
+  const cx = cells.reduce((n, c) => n + c.x, 0) / cells.length + 0.5;
+  const cz = cells.reduce((n, c) => n + c.z, 0) / cells.length + 0.5;
+  const low = Math.min(...cells.map((c) => c.y));
+  doing(bot, "dropping into the End portal from above");
+  const until = Date.now() + 45_000;
+  bot.pathfinder.setGoal(null);
+  while (!inEnd(bot) && Date.now() < until && bot.entity && currentMode() === "game") {
+    await sleep(10);
+    await guard(bot);
+    const p = bot.entity.position;
+    const off = Math.hypot(p.x - cx, p.z - cz);
+    if (off > 0.3) {
+      // Line up over the centre: short bursts toward it (the column below must be the portal's).
+      await bot.lookAt(new Vec3(cx, p.y + 1.2, cz), true).catch(() => {});
+      bot.setControlState("sprint", false);
+      bot.setControlState("forward", true);
+      await sleep(off > 2 ? 160 : 60);
+      bot.setControlState("forward", false);
+      await sleep(70);
+      continue;
+    }
+    if (p.y < low + 0.9) {
+      // On the portal's level: stand still and let it take us.
+      await sleep(250);
+      continue;
+    }
+    const f = p.floored();
+    const below = bot.blockAt(f.offset(0, -1, 0));
+    if (below && below.boundingBox === "block" && below.name !== "end_portal_frame") {
+      await equip(bot, "netherite_pickaxe");
+      if (bot.targetDigBlock) {
+        bot.stopDigging();
+        await sleep(100);
+      }
+      await bot.dig(below, true).catch(() => {});
+    } else {
+      await sleep(150); // falling
+    }
+  }
+  bot.clearControlStates();
+  return inEnd(bot);
+}
+
 async function jumpIn(bot: Bot): Promise<void> {
   doing(bot, "jumping into the End portal");
   const id = bot.registry.blocksByName.end_portal?.id;
@@ -1992,6 +2045,10 @@ async function jumpIn(bot: Bot): Promise<void> {
   // 1,700-block walk from world spawn.
   if (!inEnd(bot) && state.endPortal) {
     await bedAtPortal(bot, { x: cell.position.x, y: cell.position.y, z: cell.position.z }).catch(() => {});
+  }
+  // Above the portal (arrived from the ceiling, or the frames' platform is out of reach): drop in.
+  if (bot.entity.position.y > cell.position.y + 1.5 && flat(bot.entity.position, cell.position) < 16) {
+    if (await dropIntoPortal(bot, cell.position)) return;
   }
   if (await walkInto(bot, cell.position, "end_portal", () => inEnd(bot))) return;
   // Fallback: stand on the nearest frame next to the portal and walk into it.
