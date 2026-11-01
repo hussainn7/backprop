@@ -1127,10 +1127,7 @@ async function huntBlazes(bot: Bot): Promise<void> {
     await talk(bot, "climb", `Under the fortress, climbing up to it`, 60_000);
     // First try the pathfinder for short climbs; for anything real, dig a stair up.
     if (bot.entity.position.y < f.y - 12) {
-      if (!(await ascendTo(bot, f.y, f))) {
-        const a = Math.random() * Math.PI * 2;
-        await goNear(bot, { x: bot.entity.position.x + Math.cos(a) * 8, y: bot.entity.position.y, z: bot.entity.position.z + Math.sin(a) * 8 }, 2, 15_000, true);
-      }
+      if (!(await ascendTo(bot, f.y, f))) await sleep(4000); // no hot loop of doomed pathfinder searches
       return;
     }
     await goNear(bot, { x: f.x, y: f.y + 1, z: f.z }, 3, 45_000, true);
@@ -1482,6 +1479,51 @@ async function swimOutOfLava(bot: Bot, to: { x: number; z: number }, targetY: nu
   }
 }
 
+/**
+ * Pillar straight up on cobblestone: jump, place a block under the feet, repeat. For
+ * when there is no wall to cut a stair into (standing on a ledge in a lava sea). Refuses
+ * to open a headroom cell that is lava; digs a solid ceiling out of the way.
+ */
+async function pillarUp(bot: Bot, targetY: number): Promise<boolean> {
+  const until = Date.now() + 90_000;
+  let placed = 0;
+  doing(bot, `pillaring up to y=${targetY}`);
+  try {
+    while (bot.entity && bot.entity.position.y < targetY - 1 && Date.now() < until && currentMode() === "game") {
+      const p = bot.entity.position.floored();
+      for (const dy of [2, 3]) {
+        const b = bot.blockAt(p.offset(0, dy, 0));
+        if (!b || HAZARD.test(b.name)) return false;
+        if (b.boundingBox === "block") {
+          await equip(bot, "netherite_pickaxe");
+          await bot.dig(b, true).catch(() => {});
+          if (bot.blockAt(p.offset(0, dy, 0))?.boundingBox === "block") return false;
+        }
+      }
+      if (!(await equip(bot, "cobblestone"))) {
+        console.log(`[Speedrun] ${bot.username}: pillar stopped, no cobblestone (placed ${placed})`);
+        return false;
+      }
+      const support = bot.blockAt(p.offset(0, -1, 0));
+      if (!support || support.boundingBox !== "block") return false;
+      bot.pathfinder.setGoal(null);
+      await bot.look(bot.entity.yaw, -Math.PI / 2, true).catch(() => {});
+      bot.setControlState("jump", true);
+      const t = Date.now();
+      while (Date.now() - t < 700 && bot.entity.position.y < p.y + 1.05) await sleep(30);
+      await bot.placeBlock(support, new Vec3(0, 1, 0)).catch(() => {});
+      bot.setControlState("jump", false);
+      await sleep(150);
+      if (bot.entity.position.y < p.y + 0.5) return false;
+      placed++;
+    }
+    return !!bot.entity && bot.entity.position.y >= targetY - 1;
+  } finally {
+    bot.clearControlStates();
+    console.log(`[Speedrun] ${bot.username}: pillared ${placed} blocks, now y=${Math.round(bot.entity?.position.y ?? 0)}`);
+  }
+}
+
 async function ascendTo(bot: Bot, targetY: number, to?: { x: number; z: number }): Promise<boolean> {
   const until = Date.now() + 240_000;
   let i = 0;
@@ -1499,6 +1541,8 @@ async function ascendTo(bot: Bot, targetY: number, to?: { x: number; z: number }
     if (!stepOk || !clear.every((c) => cellSafe(bot, c))) {
       if (++failures >= 6) {
         aborted = `no safe step at ${ahead} (${stepBlock?.name})`;
+        // Nothing solid to cut a stair into (a ledge in a lava sea): pillar straight up.
+        if (await pillarUp(bot, targetY)) return true;
         // Boxed in by lava: swim up and out instead (needs fire resistance).
         if (to && lavaNear(bot, 2) && (await swimOutOfLava(bot, to, targetY))) {
           failures = 0;
