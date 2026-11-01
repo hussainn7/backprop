@@ -1378,7 +1378,13 @@ async function descendTo(bot: Bot, targetY: number): Promise<boolean> {
   let failures = 0;
   let aborted = "";
   doing(bot, `digging down to y=${targetY} (${Math.round(bot.entity.position.y - targetY)} to go)`);
+  let loops = 0;
   while (bot.entity && bot.entity.position.y > targetY + 1 && Date.now() < until && currentMode() === "game") {
+    if (++loops > 600) {
+      aborted = "loop cap";
+      break;
+    }
+    await sleep(10);
     const p = bot.entity.position.floored();
     const [dx, dz] = SPIRAL[i % SPIRAL.length];
     const ahead = p.offset(dx, 0, dz);
@@ -1457,6 +1463,7 @@ async function descendTo(bot: Bot, targetY: number): Promise<boolean> {
  * solid ground out of the lava. Refuses without protection (and eats an apple first).
  */
 async function swimOutOfLava(bot: Bot, to: { x: number; z: number }, targetY: number): Promise<boolean> {
+  if (!inLavaNow(bot)) return false; // nothing to swim out of
   const until = Date.now() + 60_000;
   doing(bot, "swimming up out of the lava (fire resistance)");
   bot.pathfinder.setGoal(null);
@@ -1530,7 +1537,13 @@ async function ascendTo(bot: Bot, targetY: number, to?: { x: number; z: number }
   let failures = 0;
   let aborted = "";
   doing(bot, `digging up to y=${targetY} (${Math.round(targetY - bot.entity.position.y)} to go)`);
+  let loops = 0;
   while (bot.entity && bot.entity.position.y < targetY - 1 && Date.now() < until && currentMode() === "game") {
+    if (++loops > 400) {
+      aborted = "loop cap";
+      break;
+    }
+    await sleep(10); // always yield: a spin here froze the whole process (millions of iterations)
     const p = bot.entity.position.floored();
     const [dx, dz] = SPIRAL[i % SPIRAL.length];
     const ahead = p.offset(dx, 0, dz);
