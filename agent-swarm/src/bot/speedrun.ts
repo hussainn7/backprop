@@ -36,7 +36,7 @@ import { baseMoves, safeGoto } from "./navigation.js";
 import { recordDeath, dimKey } from "./danger.js";
 import { Swimmer } from "./swim.js";
 import { abortActiveSkill, isSkillRunning } from "../skills/executor.js";
-import { ARROW, flightPath, flightTicks, solvePitch } from "../learn/ballistics.js";
+import { ARROW, flightPath, flightTicks, solvePitch, type Projectile } from "../learn/ballistics.js";
 
 const { goals } = pkg;
 
@@ -384,6 +384,76 @@ function moves(bot: Bot, dig: boolean) {
   mm.allowParkour = false;
   return m;
 }
+const PEARL: Projectile = { speed: 1.5, gravity: 0.03, drag: 0.99, launchHeight: 1.62 };
+const lastPearl = new Map<string, number>();
+
+/**
+ * Fast travel: from solid ground, throw an ender pearl to a safe landing spot ~30 blocks toward
+ * `dest`. The landing is chosen (solid floor, two free cells, no lava anywhere near), the pitch
+ * solved with the ballistics model, and the arc traced for walls. Never from lava or water.
+ */
+async function pearlHop(bot: Bot, dest: { x: number; z: number }): Promise<boolean> {
+  if (!bot.entity || inLavaNow(bot) || new Swimmer(bot).inWater()) return false;
+  if (count(bot, "ender_pearl") <= 6 || Date.now() - (lastPearl.get(bot.username) ?? 0) < 4000) return false;
+  const me = bot.entity.position;
+  if (bot.blockAt(me.floored().offset(0, -1, 0))?.boundingBox !== "block") return false; // not on solid ground
+  const gap = Math.hypot(dest.x - me.x, dest.z - me.z);
+  if (gap < 45) return false;
+  const ux = (dest.x - me.x) / gap;
+  const uz = (dest.z - me.z) / gap;
+  const isLava = (n?: string) => !!n && /lava|magma|fire/.test(n);
+  for (const dist of [32, 26, 20, 14]) {
+    for (const [ox, oz] of [[0, 0], [2, 0], [-2, 0], [0, 2], [0, -2], [3, 3], [-3, 3], [3, -3], [-3, -3]]) {
+      const x = Math.floor(me.x + ux * dist + ox);
+      const z = Math.floor(me.z + uz * dist + oz);
+      let land: Vec3 | null = null;
+      for (let y = Math.floor(me.y) + 8; y >= Math.floor(me.y) - 10 && !land; y--) {
+        const b = bot.blockAt(new Vec3(x, y, z));
+        if (!b || b.boundingBox !== "block" || isLava(b.name)) continue;
+        const a1 = bot.blockAt(new Vec3(x, y + 1, z));
+        const a2 = bot.blockAt(new Vec3(x, y + 2, z));
+        if (!a1 || !a2 || a1.boundingBox === "block" || a2.boundingBox === "block") continue;
+        // no lava on the landing or beside it (a pearl that lands at the edge drops the bot in)
+        let near = false;
+        for (const [qx, qz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) if (isLava(bot.blockAt(new Vec3(x + qx, y, z + qz))?.name) || isLava(bot.blockAt(new Vec3(x + qx, y + 1, z + qz))?.name)) near = true;
+        if (isLava(a1.name) || isLava(a2.name) || near) continue;
+        land = new Vec3(x + 0.5, y + 1, z + 0.5);
+      }
+      if (!land) continue;
+      const dx = land.x - me.x;
+      const dz = land.z - me.z;
+      const d = Math.hypot(dx, dz);
+      const dy = land.y + 0.3 - me.y;
+      const pitch = solvePitch(PEARL, d, dy);
+      if (pitch === null) continue;
+      let clear = true;
+      for (const [fwd, h] of flightPath(PEARL, pitch, dy, d)) {
+        if (fwd > d - 1.0) break;
+        const q = bot.blockAt(new Vec3(me.x + (dx / d) * fwd, me.y + h, me.z + (dz / d) * fwd).floored());
+        if (q && q.boundingBox === "block") {
+          clear = false;
+          break;
+        }
+      }
+      if (!clear) continue;
+      if (!(await equip(bot, "ender_pearl"))) return false;
+      bot.pathfinder.setGoal(null);
+      bot.clearControlStates();
+      await bot.look(Math.atan2(-dx, -dz), pitch, true);
+      lastPearl.set(bot.username, Date.now());
+      const from = bot.entity.position.clone();
+      bot.activateItem();
+      const t = Date.now();
+      while (Date.now() - t < 3500 && bot.entity.position.distanceTo(from) < 6) await sleep(100);
+      const moved = bot.entity.position.distanceTo(from);
+      console.log(`[Speedrun] ${bot.username}: pearl hop ${moved > 6 ? "landed" : "missed"} (${Math.round(moved)} blocks, ${count(bot, "ender_pearl")} pearls left)`);
+      await sleep(250);
+      return moved > 6;
+    }
+  }
+  return false;
+}
+
 /** Where each bot is currently trying to get to; the swimmer steers by it while in water. */
 const destOf = new Map<string, { p: Vec3; at: number }>();
 function setDest(bot: Bot, p: { x: number; y?: number; z: number }): void {
@@ -417,6 +487,8 @@ async function march(bot: Bot, target: XYZ | { x: number; z: number }, ms: numbe
       beforeHop: async () => {
         await defend(bot, 6);
         await topUp(bot);
+        // Speed matters: a pearl covers ~30 blocks in a second; chain them while far from the goal.
+        for (let k = 0; k < 6 && (await pearlHop(bot, target)); k++) await defend(bot, 6);
       },
     });
   } finally {
@@ -1496,9 +1568,35 @@ async function descendTo(bot: Bot, targetY: number): Promise<boolean> {
  * With fire resistance lava is just slow water: swim up and toward `to` until standing on
  * solid ground out of the lava. Refuses without protection (and eats an apple first).
  */
+/** Closest solid ground (two free cells above, no lava) within ~14 blocks: where to get out of lava. */
+function nearestLand(bot: Bot): Vec3 | null {
+  const p = bot.entity.position.floored();
+  let best: Vec3 | null = null;
+  let bd = Infinity;
+  for (let dx = -14; dx <= 14; dx++)
+    for (let dz = -14; dz <= 14; dz++)
+      for (let dy = -4; dy <= 8; dy++) {
+        const q = p.offset(dx, dy, dz);
+        const b = bot.blockAt(q);
+        if (!b || b.boundingBox !== "block" || /lava|magma/.test(b.name)) continue;
+        const a1 = bot.blockAt(q.offset(0, 1, 0));
+        const a2 = bot.blockAt(q.offset(0, 2, 0));
+        if (!a1 || !a2 || a1.boundingBox === "block" || a2.boundingBox === "block") continue;
+        if (/lava/.test(a1.name) || /lava/.test(a2.name)) continue;
+        const d = Math.hypot(dx, dz) + Math.abs(dy) * 0.6;
+        if (d < bd) {
+          bd = d;
+          best = q.offset(0.5, 1, 0.5);
+        }
+      }
+  return best;
+}
+
 async function swimOutOfLava(bot: Bot, to: { x: number; z: number }, targetY: number): Promise<boolean> {
   if (!inLavaNow(bot)) return false; // nothing to swim out of
   const until = Date.now() + 60_000;
+  let exit: Vec3 | null = null;
+  let exitAt = 0;
   doing(bot, "swimming up out of the lava (fire resistance)");
   bot.pathfinder.setGoal(null);
   try {
@@ -1509,7 +1607,14 @@ async function swimOutOfLava(bot: Bot, to: { x: number; z: number }, targetY: nu
       const below = bot.blockAt(f.offset(0, -1, 0));
       if (!inLava && below?.boundingBox === "block" && !/lava/.test(below.name)) return true; // on solid ground
       if (!hasFireResistance(bot) && !(await fireResist(bot, "swimming in lava"))) return false;
-      await bot.lookAt(new Vec3(to.x + 0.5, pos.y + 1.0, to.z + 0.5), true).catch(() => {});
+      // Lava is very slow to swim: make for the NEAREST solid ground (not the far destination),
+      // refreshed once a second, then carry on from there.
+      if (Date.now() - exitAt > 1000) {
+        exitAt = Date.now();
+        exit = nearestLand(bot);
+      }
+      const aim = exit ?? new Vec3(to.x + 0.5, pos.y + 1.0, to.z + 0.5);
+      await bot.lookAt(aim.offset(0, 0.4, 0), true).catch(() => {});
       bot.setControlState("jump", true);
       bot.setControlState("forward", true);
       await sleep(150);
