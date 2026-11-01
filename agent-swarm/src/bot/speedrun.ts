@@ -1073,10 +1073,13 @@ async function walkInto(bot: Bot, near: XYZ, block: string, done: () => boolean)
 }
 
 const bedFailAt = new Map<string, number>();
+const bedAttemptAt = new Map<string, number>();
 
 /** Place a bed beside the overworld portal and click it: a death then respawns here, not 1,700 blocks away. */
 async function bedAtPortal(bot: Bot, door: XYZ): Promise<void> {
   if (!inOverworld(bot)) return; // beds explode in the Nether and the End
+  if (Date.now() - (bedAttemptAt.get(bot.username) ?? 0) < 20_000) return; // never a tight retry loop
+  bedAttemptAt.set(bot.username, Date.now());
   const key = `${Math.round(door.x / 8)},${Math.round(door.y / 8)},${Math.round(door.z / 8)}`;
   state.beds ??= {};
   if ((state.beds[bot.username] ?? "").split(";").includes(key)) return;
@@ -1084,8 +1087,9 @@ async function bedAtPortal(bot: Bot, door: XYZ): Promise<void> {
   if (Date.now() - (bedFailAt.get(bot.username) ?? 0) < 600_000) return;
   const bedItem = bot.inventory.items().find((i) => i.name.endsWith("_bed"));
   if (!bedItem) return; // out of beds: the kit tops them up
-  const d = v(door);
-  if (bot.entity.position.distanceTo(d) > 24) return; // chunks around the portal must be in view
+  // Search around where the bot stands (it is within ~22 blocks of the goal): the goal itself may be deep
+  // underground or in rock, and a bed 25 blocks above it still keeps the progress.
+  const d = bot.entity.position.floored();
   const free = (q: Vec3) => {
     const b = bot.blockAt(q);
     return !!b && (b.name === "air" || b.name === "cave_air" || SOFT.test(b.name)) && b.name !== "nether_portal";
@@ -2294,6 +2298,17 @@ function openWaterAhead(bot: Bot, dest: Vec3): boolean {
   return wet >= 12;
 }
 
+/** Everything boatTravel needs before it will launch, decided synchronously so callers can fall back. */
+function boatReady(bot: Bot, dest: Vec3): boolean {
+  return (
+    !boating.has(bot.username) &&
+    !boatsDisabled() &&
+    count(bot, "oak_boat") > 0 &&
+    Date.now() - (lastBoat.get(bot.username) ?? 0) >= 60_000 &&
+    openWaterAhead(bot, dest)
+  );
+}
+
 async function boatTravel(bot: Bot, dest: Vec3): Promise<boolean> {
   if (boating.has(bot.username) || boatsDisabled() || !count(bot, "oak_boat")) return false;
   if (!openWaterAhead(bot, dest)) return false; // not worth a boat (and a cave pool cannot take one)
@@ -2879,11 +2894,10 @@ export function startSpeedrun(bot: Bot, brain: Pausable): void {
       Date.now() - dFar.at < 60_000 &&
       Date.now() - waterSince.get(bot.username)! > 4000 &&
       flat(bot.entity.position, dFar.p) > 60 &&
-      count(bot, "oak_boat") &&
-      !boatsDisabled()
+      boatReady(bot, dFar.p)
     ) {
       void boatTravel(bot, dFar.p);
-      return;
+      return; // only when the boat really launches; a declined boat must never stop the swimming
     }
     const d = destOf.get(bot.username);
     let target: Vec3;
@@ -3045,7 +3059,15 @@ export function startSpeedrun(bot: Bot, brain: Pausable): void {
       if (state.stronghold) goals.push({ x: state.stronghold.x, y: bot.entity.position.y, z: state.stronghold.z });
       if (state.endPortal) goals.push(state.endPortal);
       const near = goals.find((g) => flat(bot.entity.position, g) < 22);
-      if (near && !(waiting && state.phase !== "stronghold")) {
+      const key = near ? `${Math.round(near.x / 8)},${Math.round(near.y / 8)},${Math.round(near.z / 8)}` : "";
+      const alreadyBed = (state.beds?.[bot.username] ?? "").split(";").includes(key);
+      const bedOk =
+        !!near &&
+        !alreadyBed &&
+        bot.inventory.items().some((i) => i.name.endsWith("_bed")) &&
+        Date.now() - (bedAttemptAt.get(bot.username) ?? 0) > 180_000 &&
+        Date.now() - (bedFailAt.get(bot.username) ?? 0) > 600_000;
+      if (near && bedOk && !(waiting && state.phase !== "stronghold")) {
         busy = true;
         void bedAtPortal(bot, near).finally(() => (busy = false));
         return;
