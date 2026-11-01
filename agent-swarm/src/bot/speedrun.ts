@@ -1395,9 +1395,18 @@ function exitPortalOpen(bot: Bot): boolean {
 }
 
 const dragonVel = new WeakMap<Entity, () => Vec3>();
+const endWait = new Map<string, number>();
+
+/** A totem in the off-hand is one free life; the shield keeper leaves it alone. */
+async function totemUp(bot: Bot): Promise<void> {
+  if (bot.inventory.slots[45]?.name === "totem_of_undying") return;
+  const t = bot.inventory.items().find((i) => i.name === "totem_of_undying");
+  if (t) await bot.equip(t, "off-hand").catch(() => {});
+}
 
 async function fightDragon(bot: Bot, index: number): Promise<void> {
   doing(bot, "fighting the Ender Dragon");
+  await totemUp(bot);
   if (exitPortalOpen(bot)) {
     setPhase("done", `THE DRAGON IS DEAD. Squad ${SQUAD} finished in ${elapsed()}!`);
     return;
@@ -1743,6 +1752,16 @@ async function step(bot: Bot): Promise<void> {
       }
       if (state.endPortal && flat(bot.entity.position, state.endPortal) > 40) {
         await march(bot, state.endPortal, 180_000, () => flat(bot.entity.position, state.endPortal!) < 24);
+        return;
+      }
+      // Enter together: one bot alone in the End is dead in minutes (the dragon hits for ~10).
+      const onSide = squadBots().filter((b) => b.entity && inOverworld(b));
+      const atPortal = onSide.filter((b) => state.endPortal && flat(b.entity.position, state.endPortal) < 30).length;
+      const t0 = endWait.get(me) ?? Date.now();
+      endWait.set(me, t0);
+      if (atPortal < Math.min(4, onSide.length) && Date.now() - t0 < 240_000) {
+        doing(bot, `waiting for the squad at the End portal (${atPortal}/${Math.min(4, onSide.length)})`);
+        await sleep(2000);
         return;
       }
       return jumpIn(bot);
