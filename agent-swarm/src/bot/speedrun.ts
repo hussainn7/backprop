@@ -1434,6 +1434,59 @@ function exitPortalOpen(bot: Bot): boolean {
   return !!b && Math.hypot(b.position.x, b.position.z) < 8;
 }
 
+/**
+ * The End's arrival platform floats ~50 blocks of void away from the main island and the
+ * pathfinder finds no path across. Bridge it: sneak (so the edge never drops the bot), place
+ * cobblestone on the block below, step onto it, repeat; dig through the island's rim on arrival.
+ */
+async function bridgeToIsland(bot: Bot): Promise<void> {
+  doing(bot, "bridging across the void to the island");
+  const until = Date.now() + 150_000;
+  bot.pathfinder.setGoal(null);
+  bot.setControlState("sneak", true);
+  let placed = 0;
+  try {
+    while (Date.now() < until && bot.entity && currentMode() === "game") {
+      const p = bot.entity.position;
+      const f = p.floored();
+      const under = bot.blockAt(f.offset(0, -1, 0));
+      if (under?.name === "end_stone") break; // on the island
+      const dx = Math.abs(p.x) >= Math.abs(p.z) ? -Math.sign(p.x) : 0;
+      const dz = dx === 0 ? -Math.sign(p.z) : 0;
+      for (const up of [0, 1]) {
+        const b = bot.blockAt(f.offset(dx, up, dz));
+        if (b && b.boundingBox === "block") {
+          await equip(bot, "netherite_pickaxe");
+          await bot.dig(b, true).catch(() => {});
+        }
+      }
+      const aheadFloor = bot.blockAt(f.offset(dx, -1, dz));
+      if (aheadFloor && aheadFloor.boundingBox !== "block") {
+        if (!(await equip(bot, "cobblestone")) || !under || under.boundingBox !== "block") {
+          console.log(`[Speedrun] ${bot.username}: bridge stopped (cobblestone ${count(bot, "cobblestone")}, under ${under?.name})`);
+          break;
+        }
+        await bot.placeBlock(under, new Vec3(dx, 0, dz)).catch(() => {});
+        placed++;
+        await sleep(120);
+      }
+      const target = f.offset(dx, 0, dz).offset(0.5, 0, 0.5);
+      bot.setControlState("forward", true);
+      const t = Date.now();
+      while (Date.now() - t < 900) {
+        await bot.lookAt(target.offset(0, 1.2, 0), true).catch(() => {});
+        const q = bot.entity.position;
+        if (Math.hypot(q.x - target.x, q.z - target.z) < 0.35) break;
+        await sleep(60);
+      }
+      bot.setControlState("forward", false);
+    }
+  } finally {
+    bot.clearControlStates();
+  }
+  console.log(`[Speedrun] ${bot.username}: bridge placed ${placed} blocks, now at ${bot.entity.position.floored()}`);
+}
+
 const dragonVel = new WeakMap<Entity, () => Vec3>();
 const endWait = new Map<string, number>();
 
@@ -1463,7 +1516,12 @@ async function fightDragon(bot: Bot, index: number): Promise<void> {
   }
   const centreGap = Math.hypot(me.x, me.z);
   if (centreGap > 45) {
-    // From the arrival platform to the island: march (it bridges over the void with cobblestone).
+    const under = bot.blockAt(me.floored().offset(0, -1, 0));
+    if (under?.name !== "end_stone") {
+      // On the obsidian arrival platform (or a bridge): cross the void.
+      await bridgeToIsland(bot);
+      return;
+    }
     await march(bot, { x: 0, y: 64, z: 0 }, 90_000, () => Math.hypot(bot.entity.position.x, bot.entity.position.z) < 30);
     return;
   }
