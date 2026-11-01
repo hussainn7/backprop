@@ -2015,6 +2015,47 @@ async function dropIntoPortal(bot: Bot, cell: Vec3): Promise<boolean> {
   return inEnd(bot);
 }
 
+/**
+ * From the room's floor: the frames stand about two blocks above it, so a bot cannot step onto them.
+ * Walk to the outside of the nearest frame, put one block under the feet (pillar up 1), step onto the
+ * frame, and walk into the portal over it.
+ */
+async function enterFromFloor(bot: Bot, cell: Vec3): Promise<boolean> {
+  const fid = bot.registry.blocksByName.end_portal_frame?.id;
+  const pid = bot.registry.blocksByName.end_portal?.id;
+  if (fid === undefined || pid === undefined) return false;
+  const cells = bot.findBlocks({ matching: pid, maxDistance: 5, count: 12, point: cell });
+  if (!cells.length) return false;
+  const cx = cells.reduce((n, c) => n + c.x, 0) / cells.length + 0.5;
+  const cz = cells.reduce((n, c) => n + c.z, 0) / cells.length + 0.5;
+  const fy = Math.min(...cells.map((c) => c.y)); // the frames' level
+  const frames = bot.findBlocks({ matching: fid, maxDistance: 6, count: 16, point: cell });
+  if (!frames.length) return false;
+  doing(bot, "stepping up onto the End portal frame");
+  // Nearest frame, and the floor cell just outside it (away from the centre).
+  frames.sort((a, b) => a.distanceTo(bot.entity.position) - b.distanceTo(bot.entity.position));
+  const f = frames[0];
+  const ox = Math.sign(f.x + 0.5 - cx) || 0;
+  const oz = Math.sign(f.z + 0.5 - cz) || 0;
+  const outside = new Vec3(f.x + (Math.abs(f.x + 0.5 - cx) >= Math.abs(f.z + 0.5 - cz) ? ox : 0), fy - 1, f.z + (Math.abs(f.x + 0.5 - cx) >= Math.abs(f.z + 0.5 - cz) ? 0 : oz));
+  await goNear(bot, outside.offset(0.5, 0, 0.5), 1, 15_000, false);
+  if (bot.entity.position.y > fy - 0.4) return false; // already up: the normal walk-in will do
+  if (flat(bot.entity.position, outside) > 2) return false;
+  bot.pathfinder.setGoal(null);
+  if (!(await pillarUp(bot, fy + 1))) return false; // one block under the feet (pillarUp stops 1 short of its target)
+  // Up on the step: walk toward the centre, hopping onto the frame, and let the portal take us.
+  const until = Date.now() + 8000;
+  bot.setControlState("forward", true);
+  while (!inEnd(bot) && Date.now() < until) {
+    await bot.lookAt(new Vec3(cx, bot.entity.position.y + 1.2, cz), true).catch(() => {});
+    bot.setControlState("jump", bot.entity.position.y < fy + 0.8);
+    await sleep(80);
+  }
+  bot.clearControlStates();
+  if (!inEnd(bot)) await sleep(1500);
+  return inEnd(bot);
+}
+
 async function jumpIn(bot: Bot): Promise<void> {
   doing(bot, "jumping into the End portal");
   const id = bot.registry.blocksByName.end_portal?.id;
@@ -2049,6 +2090,10 @@ async function jumpIn(bot: Bot): Promise<void> {
   // Above the portal (arrived from the ceiling, or the frames' platform is out of reach): drop in.
   if (bot.entity.position.y > cell.position.y + 1.5 && flat(bot.entity.position, cell.position) < 16) {
     if (await dropIntoPortal(bot, cell.position)) return;
+  }
+  // On the room's floor, below the frames: step up onto a frame (the pathfinder cannot).
+  if (bot.entity.position.y < cell.position.y - 0.4 && flat(bot.entity.position, cell.position) < 10) {
+    if (await enterFromFloor(bot, cell.position)) return;
   }
   if (await walkInto(bot, cell.position, "end_portal", () => inEnd(bot))) return;
   // Fallback: stand on the nearest frame next to the portal and walk into it.
