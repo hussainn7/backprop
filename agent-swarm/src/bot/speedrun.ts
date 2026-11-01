@@ -1392,7 +1392,21 @@ async function jumpIn(bot: Bot): Promise<void> {
   const id = bot.registry.blocksByName.end_portal?.id;
   const cell = id !== undefined ? bot.findBlock({ matching: id, maxDistance: 48 }) : null;
   if (!cell) {
-    if (state.endPortal) await goNear(bot, v(state.endPortal).offset(0, 1, 2), 3, 60_000);
+    const ep = state.endPortal;
+    if (!ep) return;
+    if (bot.entity.position.y > ep.y + 8) {
+      // The portal room is deep underground: get over it, then follow/dig the stair down.
+      if (flat(bot.entity.position, ep) > 6) {
+        await goNear(bot, { x: ep.x, y: bot.entity.position.y, z: ep.z }, 3, 60_000);
+        return;
+      }
+      if (!(await descendTo(bot, ep.y + 1))) {
+        const a = Math.random() * Math.PI * 2;
+        await goNear(bot, { x: ep.x + Math.cos(a) * 5, y: bot.entity.position.y, z: ep.z + Math.sin(a) * 5 }, 2, 15_000);
+      }
+      return;
+    }
+    await goNear(bot, v(ep).offset(0, 1, 2), 3, 60_000);
     return;
   }
   if (await walkInto(bot, cell.position, "end_portal", () => inEnd(bot))) return;
