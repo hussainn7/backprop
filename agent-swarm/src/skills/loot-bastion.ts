@@ -5,6 +5,7 @@ const { goals } = pkg;
 import { baseMoves, safeGoto } from "../bot/navigation.js";
 import { belowRouteCost, routeFloor } from "../bot/route-floor.js";
 import { brakeToStop } from "../bot/brake.js";
+import { dangerCost, dimKey } from "../bot/danger.js";
 import { Vec3 } from "vec3";
 
 /**
@@ -160,6 +161,10 @@ export async function marchToward(
   // or a pillar top after a walk ended, and those spots are now recorded as
   // fall origins that every bot's routes avoid for a day.
   const marchMoves = baseMoves(bot);
+  // Learned map of where bots have died: route around those spots.
+  (marchMoves as unknown as { exclusionAreasStep: ((b: never) => number)[] }).exclusionAreasStep.push(((b: {
+    position?: Vec3;
+  }) => (b?.position ? dangerCost(dimKey(bot.game?.dimension), b.position) : 0)) as unknown as (b: never) => number);
   (marchMoves as unknown as { canDig: boolean }).canDig = true;
   (marchMoves as unknown as { allow1by1towers: boolean }).allow1by1towers = true;
   (marchMoves as unknown as { maxDropDown: number }).maxDropDown = 3;

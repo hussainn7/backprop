@@ -33,6 +33,7 @@ import pkg from "mineflayer-pathfinder";
 import { SQUAD, squadBots, leaderName, isLeader, squadName, type Archetype } from "./squad.js";
 import { currentMode } from "./hunt-mode.js";
 import { baseMoves, safeGoto } from "./navigation.js";
+import { recordDeath, dimKey } from "./danger.js";
 import { abortActiveSkill, isSkillRunning } from "../skills/executor.js";
 import { ARROW, flightPath, flightTicks, solvePitch } from "../learn/ballistics.js";
 
@@ -1650,7 +1651,12 @@ export function startSpeedrun(bot: Bot, brain: Pausable): void {
   void import("../stream/race.js")
     .then(({ startRaceServers }) => startRaceServers(raceSnapshot))
     .catch((e) => console.warn(`[Race] ${(e as Error).message}`));
-  bot.on("death", () => doing(bot, "died, respawning"));
+  bot.on("death", () => {
+    doing(bot, "died, respawning");
+    // Learn from it: every later route in this dimension prices this spot up.
+    const p = bot.entity?.position;
+    if (p) recordDeath(dimKey(bot.game?.dimension), p);
+  });
   // The pathfinder swallows dig errors ("dig_error" resets): log the first few of each bot.
   {
     const origDig = bot.dig.bind(bot) as (...a: unknown[]) => Promise<void>;
