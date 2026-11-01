@@ -2440,6 +2440,37 @@ async function step(bot: Bot): Promise<void> {
 export function startSpeedrun(bot: Bot, brain: Pausable): void {
   if (process.env.SPEEDRUN_DIRECTOR !== "true") return;
   captureChat(bot);
+  // Stall diagnostics: slow block searches (with their caller) and what every bot was doing when
+  // the whole process froze. Cheap; logged lines start with [Slow] / [Stall].
+  {
+    const b = bot as unknown as Record<string, (...a: unknown[]) => unknown>;
+    for (const fn of ["findBlocks", "findBlock"]) {
+      const orig = b[fn].bind(bot);
+      b[fn] = (...a: unknown[]) => {
+        const t = Date.now();
+        const r = orig(...a);
+        const ms = Date.now() - t;
+        if (ms > 100) {
+          const caller = String(new Error().stack ?? "").split("
+").slice(2, 5).map((l) => l.trim().replace(/^at /, "").replace(/\(.*[\/]/, "(")).join(" < ");
+          console.warn(`[Slow] ${bot.username} ${fn} took ${ms} ms (${JSON.stringify((a[0] as { maxDistance?: number })?.maxDistance ?? "")}) ${caller}`);
+        }
+        return r;
+      };
+    }
+  }
+  if (!(globalThis as { __stallWatch?: boolean }).__stallWatch) {
+    (globalThis as { __stallWatch?: boolean }).__stallWatch = true;
+    let last = Date.now();
+    setInterval(() => {
+      const now = Date.now();
+      if (now - last > 1500) {
+        const acts = [...doingMap.entries()].map(([n, d]) => `${n}: ${d.text.slice(0, 40)}`).join(" | ");
+        console.warn(`[Stall] process frozen ${Math.round((now - last) / 100) / 10}s; bots were: ${acts}`);
+      }
+      last = now;
+    }, 250).unref();
+  }
   // Water: the pathfinder cannot plan swims (it just jumps). While in water with a known
   // destination, the Swimmer is in charge: dive and sprint-swim underwater, surface for air
   // below 40%, climb out at ledges. Pathfinder goals are ignored until the bot is out.
