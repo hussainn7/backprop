@@ -34,6 +34,7 @@ import { SQUAD, squadBots, leaderName, isLeader, squadName, type Archetype } fro
 import { currentMode } from "./hunt-mode.js";
 import { baseMoves, safeGoto } from "./navigation.js";
 import { recordDeath, dimKey } from "./danger.js";
+import { Swimmer } from "./swim.js";
 import { abortActiveSkill, isSkillRunning } from "../skills/executor.js";
 import { ARROW, flightPath, flightTicks, solvePitch } from "../learn/ballistics.js";
 
@@ -383,7 +384,14 @@ function moves(bot: Bot, dig: boolean) {
   mm.allowParkour = false;
   return m;
 }
+/** Where each bot is currently trying to get to; the swimmer steers by it while in water. */
+const destOf = new Map<string, { p: Vec3; at: number }>();
+function setDest(bot: Bot, p: { x: number; y?: number; z: number }): void {
+  destOf.set(bot.username, { p: new Vec3(p.x, p.y ?? bot.entity.position.y, p.z), at: Date.now() });
+}
+
 async function goNear(bot: Bot, p: XYZ, range: number, ms: number, dig = true): Promise<boolean> {
+  setDest(bot, p);
   bot.pathfinder.setMovements(moves(bot, dig));
   await safeGoto(bot, new goals.GoalNear(p.x, p.y, p.z, range), ms).catch(() => {});
   return !!bot.entity && bot.entity.position.distanceTo(v(p)) <= range + 1.5;
@@ -391,6 +399,7 @@ async function goNear(bot: Bot, p: XYZ, range: number, ms: number, dig = true): 
 
 /** Long walk in hops (handles lava, cliffs, stalls). Returns when close, stopped or out of time. */
 async function march(bot: Bot, target: XYZ | { x: number; z: number }, ms: number, stop: () => boolean): Promise<void> {
+  setDest(bot, target as { x: number; y?: number; z: number });
   {
     const cur = (doingMap.get(bot.username)?.text ?? "walking").split(" (")[0];
     doing(bot, `${cur} (${Math.round(flat(bot.entity.position, target))} blocks to ${Math.round(target.x)} ${Math.round(target.z)})`);
@@ -2282,6 +2291,35 @@ async function step(bot: Bot): Promise<void> {
 export function startSpeedrun(bot: Bot, brain: Pausable): void {
   if (process.env.SPEEDRUN_DIRECTOR !== "true") return;
   captureChat(bot);
+  // Water: the pathfinder cannot plan swims (it just jumps). While in water with a known
+  // destination, the Swimmer is in charge: dive and sprint-swim underwater, surface for air
+  // below 40%, climb out at ledges. Pathfinder goals are ignored until the bot is out.
+  const swimmer = new Swimmer(bot);
+  let swimActive = false;
+  const origSetGoal = bot.pathfinder.setGoal.bind(bot.pathfinder);
+  (bot.pathfinder as unknown as { setGoal: (g: unknown, d?: boolean) => void }).setGoal = (g: unknown, d?: boolean) => {
+    if (g && swimActive) return;
+    origSetGoal(g as never, d);
+  };
+  const swimTimer = setInterval(() => {
+    if (!bot.entity || bot.health <= 0 || currentMode() !== "game") return;
+    if (!swimmer.inWater() || inLavaNow(bot)) {
+      if (swimActive) {
+        swimActive = false;
+        swimmer.stop();
+      }
+      return;
+    }
+    const d = destOf.get(bot.username);
+    if (!d || Date.now() - d.at > 90_000) return; // no destination: leave it to the other logic
+    if (!swimActive) {
+      swimActive = true;
+      origSetGoal(null);
+      doing(bot, "swimming (diving, watching air)");
+    }
+    swimmer.step(d.p);
+  }, 250);
+  bot.once("end", () => clearInterval(swimTimer));
   let lastHp = 20;
   bot.on("health", () => {
     if (bot.health < lastHp - 0.5) hurtAt.set(bot.username, Date.now());
