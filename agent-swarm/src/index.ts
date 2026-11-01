@@ -303,10 +303,24 @@ setInterval(() => {
  */
 const HEAP_GUARD_MS = 2_000;
 const HEAP_ABORT_MB = 1500;
+const HEAP_RESTART_MB = Number(process.env.HEAP_RESTART_MB || 2400);
+let heapRestartHits = 0;
 let heapGuardTripped = false;
 
 setInterval(() => {
   const usedMb = Math.round(process.memoryUsage().heapUsed / 1048576);
+
+  // Planned restart: past ~2.4 GB the garbage collector stalls the whole process long enough
+  // for the server to drop every bot ("Timed out"), well before the 4 GB crash. Exiting cleanly
+  // lets the supervisor relaunch in seconds; bots rejoin and their progress is on disk.
+  if (usedMb >= HEAP_RESTART_MB) {
+    if (++heapRestartHits >= 3) {
+      console.error(`[HeapGuard] heapUsed=${usedMb}MB >= ${HEAP_RESTART_MB}MB — exiting for a clean supervised restart`);
+      setTimeout(() => process.exit(0), 500);
+    }
+  } else {
+    heapRestartHits = 0;
+  }
 
   if (usedMb < HEAP_ABORT_MB) {
     heapGuardTripped = false;
