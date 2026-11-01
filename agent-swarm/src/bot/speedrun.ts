@@ -1127,7 +1127,7 @@ async function huntBlazes(bot: Bot): Promise<void> {
     await talk(bot, "climb", `Under the fortress, climbing up to it`, 60_000);
     // First try the pathfinder for short climbs; for anything real, dig a stair up.
     if (bot.entity.position.y < f.y - 12) {
-      if (!(await ascendTo(bot, f.y))) {
+      if (!(await ascendTo(bot, f.y, f))) {
         const a = Math.random() * Math.PI * 2;
         await goNear(bot, { x: bot.entity.position.x + Math.cos(a) * 8, y: bot.entity.position.y, z: bot.entity.position.z + Math.sin(a) * 8 }, 2, 15_000, true);
       }
@@ -1455,7 +1455,37 @@ async function descendTo(bot: Bot, targetY: number): Promise<boolean> {
  * under the fortress. Each step keeps the block it will stand on, clears two cells of
  * headroom, refuses lava, and never opens into liquid above.
  */
-async function ascendTo(bot: Bot, targetY: number): Promise<boolean> {
+/**
+ * With fire resistance lava is just slow water: swim up and toward `to` until standing on
+ * solid ground out of the lava. Refuses without protection (and eats an apple first).
+ */
+async function swimOutOfLava(bot: Bot, to: { x: number; z: number }, targetY: number): Promise<boolean> {
+  const until = Date.now() + 60_000;
+  doing(bot, "swimming up out of the lava (fire resistance)");
+  bot.pathfinder.setGoal(null);
+  try {
+    while (Date.now() < until && bot.entity && currentMode() === "game") {
+      const pos = bot.entity.position;
+      const f = pos.floored();
+      const inLava = bot.blockAt(f)?.name === "lava" || bot.blockAt(f.offset(0, 1, 0))?.name === "lava";
+      const below = bot.blockAt(f.offset(0, -1, 0));
+      if (!inLava && below?.boundingBox === "block" && !/lava/.test(below.name) && pos.y > targetY - 40) {
+        // On land: only done once there is no lava right beside us either.
+        if (!lavaNear(bot, 1)) return true;
+      }
+      if (!hasFireResistance(bot) && !(await fireResist(bot, "swimming in lava"))) return false;
+      await bot.lookAt(new Vec3(to.x + 0.5, pos.y + 1.0, to.z + 0.5), true).catch(() => {});
+      bot.setControlState("jump", true);
+      bot.setControlState("forward", true);
+      await sleep(150);
+    }
+    return false;
+  } finally {
+    bot.clearControlStates();
+  }
+}
+
+async function ascendTo(bot: Bot, targetY: number, to?: { x: number; z: number }): Promise<boolean> {
   const until = Date.now() + 240_000;
   let i = 0;
   let failures = 0;
@@ -1472,6 +1502,12 @@ async function ascendTo(bot: Bot, targetY: number): Promise<boolean> {
     if (!stepOk || !clear.every((c) => cellSafe(bot, c))) {
       if (++failures >= 6) {
         aborted = `no safe step at ${ahead} (${stepBlock?.name})`;
+        // Boxed in by lava: swim up and out instead (needs fire resistance).
+        if (to && lavaNear(bot, 2) && (await swimOutOfLava(bot, to, targetY))) {
+          failures = 0;
+          aborted = "";
+          continue;
+        }
         break;
       }
       i++; // try the next side of the ring
