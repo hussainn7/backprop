@@ -1551,7 +1551,22 @@ async function ascendTo(bot: Bot, targetY: number, to?: { x: number; z: number }
     }
     await sleep(10); // always yield: a spin here froze the whole process (millions of iterations)
     const p = bot.entity.position.floored();
-    const [dx, dz] = SPIRAL[i % SPIRAL.length];
+    // Pick any side with solid ground to climb onto (nearest to the destination first): a wall
+    // may be on any side, and a fixed rotation tried the wrong sides while the right one waited.
+    const dirs: [number, number][] = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+    if (to) dirs.sort((a, b) => Math.hypot(p.x + a[0] - to.x, p.z + a[1] - to.z) - Math.hypot(p.x + b[0] - to.x, p.z + b[1] - to.z));
+    let dx = dirs[0][0];
+    let dz = dirs[0][1];
+    for (const [cx, cz] of dirs) {
+      const sb = bot.blockAt(p.offset(cx, 0, cz));
+      const ok = sb?.boundingBox === "block" && !HAZARD.test(sb.name) && !/sand|gravel/.test(sb.name);
+      const cl = [p.offset(cx, 1, cz), p.offset(cx, 2, cz), p.offset(0, 2, 0)];
+      if (ok && cl.every((c) => cellSafe(bot, c))) {
+        dx = cx;
+        dz = cz;
+        break;
+      }
+    }
     const ahead = p.offset(dx, 0, dz);
     const step = ahead; // solid block we climb onto
     const clear = [ahead.offset(0, 1, 0), ahead.offset(0, 2, 0), p.offset(0, 2, 0)];
