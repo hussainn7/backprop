@@ -494,12 +494,24 @@ async function handTo(bot: Bot, to: Bot, names: string[]): Promise<number> {
   }
   if (bot.entity.position.distanceTo(to.entity.position) > 4) return 0;
   let given = 0;
+  const heldBy = (b: Bot) => names.reduce((n, nm) => n + count(b, nm), 0);
+  const before = heldBy(to);
   for (const name of names) {
     for (const it of bot.inventory.items().filter((i) => i.name === name)) {
       await bot.lookAt(to.entity.position.offset(0, 0.5, 0), true).catch(() => {});
       await bot.toss(it.type, null, it.count).catch(() => {});
       given += it.count;
     }
+  }
+  // A toss can be lost (receiver rejoined, walked off, pack full). Wait for the receiver's
+  // count to rise; if it doesn't, take the items back instead of leaving them to despawn.
+  const until = Date.now() + 7000;
+  while (Date.now() < until && heldBy(to) - before < given) await sleep(300);
+  const got = Math.max(0, heldBy(to) - before);
+  if (got < given) {
+    console.warn(`[Speedrun] ${bot.username}: only ${got}/${given} ${names.join("/")} reached ${to.username}; recovering the rest`);
+    await pickUpNear(bot, names, 10, 6000);
+    given = got;
   }
   if (given) doing(bot, `handed ${given} ${names.join("/")} to ${to.username}`);
   if (given) console.log(`[Speedrun] ${bot.username} handed ${given} item(s) (${names.join("/")}) to ${to.username}`);
