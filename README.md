@@ -100,6 +100,10 @@ away, so retreats doubled to 21 %); round 2 uses Φ(s′) − Φ(s).
   and wait for the pathfinder's own result instead of cancelling slow searches; bots in
   water swim straight at him; when stuck they pearl-hop, detour, then tunnel out in 12-block
   steps, and a bot pinned for a minute rejoins for a fresh client.
+* **Guardian** (`src/bot/guardian.ts`): every 5 s in hunt mode, using the server's positions
+  for all ten bots, it lifts a bot that is inside a block to the surface, and teleports a bot
+  that has not moved 2 blocks in 25 s (and is not fighting) to a free teammate closer to the
+  target, or onto open ground on the way to him. `mc.ps1 check` shows every bot's state.
 * **1.21 enchantment fix** (`src/bot/enchant-compat.ts`): enchanted tools broke mineflayer's
   dig-time maths, so any bot that had to dig never moved; enchantments are normalized first.
 * **Help board**: a bot that drops to 8 HP or less while fighting him (not from a fall or a mob) posts a help request (`logs/help.json`); teammates

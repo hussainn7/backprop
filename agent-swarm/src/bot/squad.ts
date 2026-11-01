@@ -50,6 +50,11 @@ export function registerSquadBot(bot: Bot): void {
   });
 }
 
+/** This process's live squad bots. */
+export function squadBots(): Bot[] {
+  return [...liveBots.values()];
+}
+
 /** The leader's bot handle when it is online in this process. */
 export function leaderBot(): Bot | undefined {
   return liveBots.get(leaderName());

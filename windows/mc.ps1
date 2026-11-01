@@ -1,6 +1,6 @@
 # Windows control script for the local-only Backprop server (the PC counterpart of ./mc).
 #   .\mc.ps1 status | start | stop | restart [server|agents|alpha|bravo] | logs [server|alpha|bravo]
-#   .\mc.ps1 console "<cmd>" ...     .\mc.ps1 budget
+#   .\mc.ps1 console "<cmd>" ...     .\mc.ps1 budget     .\mc.ps1 check (hunt guardian: every bot's state)
 # Paper listens on 127.0.0.1:25565 only (offline mode, whitelist on); bots join it directly.
 # Ten bots run as two squads of five, one Node process each (one thread cannot path-find
 # for ten): alpha = Atlas (leader), Flora, Forge, Mason, Blade; Mission Control :3010
@@ -98,6 +98,19 @@ switch ($Cmd) {
     'status' {
         foreach ($p in 'server', 'alpha', 'bravo') { '{0,-8} {1}' -f $p, $(if (Children $p) { 'running' } elseif (Loops $p) { 'starting' } else { 'stopped' }) }
         if (PortOpen 25565) { Rcon @('tps', 'list') } else { '(server port closed)' }
+    }
+    'check' {
+        # Hunt guardian report: every bot's state, distance to the target, movement, rescues.
+        foreach ($s in 'alpha', 'bravo') {
+            $f = Join-Path $Swarm "logs\guardian-$s.json"
+            if (-not (Test-Path $f)) { "${s}: no guardian report yet (hunt mode off, or target not in survival)"; continue }
+            $g = Get-Content $f -Raw | ConvertFrom-Json
+            "{0}: target {1} at {2}  (report {3})" -f $s, $g.target, ($g.targetPos -join ' '), $g.at.Substring(11, 8)
+            $g.bots.PSObject.Properties | ForEach-Object {
+                $b = $_.Value
+                '  {0,-6} {1,-50} {2,5} blocks  moved {3,5}  hp {4,4}  rescues {5}' -f $_.Name, $b.status, $b.distance, $b.moved25s, $b.hp, $b.rescuesLast2min
+            }
+        }
     }
     'logs' { $p = if ($Rest) { $Rest[0] } else { 'alpha' }; Get-Content (Join-Path $Logs "$(LogName $p).log") -Tail 80 -Wait }
     'console' { Rcon $Rest }

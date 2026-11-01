@@ -41,6 +41,7 @@ import { ALL_BOT_NAMES, huntPlayer, isLeader, registerSquadBot } from "./squad.j
 import { startArmorKeeper, startHunter, startPearlTopup, startShieldKeeper } from "./hunter.js";
 import { currentMode, setMode } from "./hunt-mode.js";
 import { installEnchantFix } from "./enchant-compat.js";
+import { startGuardian } from "./guardian.js";
 
 // Re-export types used by src/index.ts
 export type { ChatMessage, BrainEvents as BotEvents };
@@ -437,6 +438,7 @@ export async function createBot(events: BrainEvents, roleConfig: BotRoleConfig =
     startShieldKeeper(bot);
     startArmorKeeper();
     startPearlTopup(BOT_ROSTER.map((r) => r.username));
+    startGuardian();
     startHunter(bot, brain);
   });
 
