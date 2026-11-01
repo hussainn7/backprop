@@ -36,9 +36,53 @@ export function normalizeEnchants(raw: unknown, idToName: (id: number) => string
 }
 
 /** Patch this bot's Block#digTime (one class per registry, so once is enough). */
-export function installEnchantFix(bot: Bot): void {
-  const sample = bot.blockAt(bot.entity.position.floored().offset(0, -1, 0)) ?? bot.blockAt(bot.entity.position.floored());
-  if (!sample) return;
+/**
+ * mineflayer's bot.digTime does heldItem.enchants.concat(helmet.enchants);
+ * with 1.21 components .enchants is an object, so EVERY dig threw
+ * "enchantments.concat is not a function" before Block#digTime was reached.
+ * Replace it per bot with the same computation over normalized lists.
+ */
+function installDigTimeFix(bot: Bot): void {
+  const b = bot as unknown as { digTime: (block: unknown) => number; __digTimeFix?: boolean; _getBlockAtEyeLevel?: () => { name?: string } | null };
+  if (b.__digTimeFix) return;
+  const registry = bot.registry as unknown as { enchantments?: Record<number, { name: string }> };
+  const idToName = (id: number) => registry.enchantments?.[id]?.name ?? null;
+  const read = (item: unknown): Ench[] => {
+    try {
+      return normalizeEnchants((item as { enchants?: unknown } | null)?.enchants, idToName);
+    } catch {
+      return [];
+    }
+  };
+  b.digTime = (block: unknown) => {
+    const held = bot.heldItem;
+    const head = bot.inventory.slots[bot.getEquipmentDestSlot("head")];
+    const enchantments = [...read(held), ...read(head)];
+    const eye = b._getBlockAtEyeLevel?.()?.name ?? "";
+    return (block as { digTime: (...a: unknown[]) => number }).digTime(
+      held ? held.type : null,
+      bot.game.gameMode === "creative",
+      ["water", "flowing_water"].includes(eye),
+      !bot.entity.onGround,
+      enchantments,
+      (bot.entity as unknown as { effects: unknown }).effects,
+    );
+  };
+  b.__digTimeFix = true;
+}
+
+export function installEnchantFix(bot: Bot, attempt = 0): void {
+  if (attempt === 0) installDigTimeFix(bot);
+  const sample = bot.entity
+    ? bot.blockAt(bot.entity.position.floored().offset(0, -1, 0)) ?? bot.blockAt(bot.entity.position.floored())
+    : null;
+  if (!sample) {
+    // Chunks often arrive after "spawn": without a retry the fix never
+    // installed and every dig failed for the whole session.
+    if (attempt < 120) setTimeout(() => installEnchantFix(bot, attempt + 1), 1000).unref?.();
+    else console.warn(`[EnchantFix] ${bot.username}: no block loaded after 120 s; digs may fail`);
+    return;
+  }
   const proto = Object.getPrototypeOf(sample) as {
     digTime: (...a: unknown[]) => number;
     __enchantFix?: boolean;
@@ -51,4 +95,5 @@ export function installEnchantFix(bot: Bot): void {
     return orig.call(this, heldItemType, creative, inWater, notOnGround, normalizeEnchants(enchantments, idToName), effects);
   };
   proto.__enchantFix = true;
+  console.log(`[EnchantFix] installed via ${bot.username} (attempt ${attempt + 1})`);
 }
