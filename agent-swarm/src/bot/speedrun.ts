@@ -1532,6 +1532,22 @@ async function fightDragon(bot: Bot, index: number): Promise<void> {
   }
   const dragon = bot.nearestEntity((e) => e.name === "ender_dragon" && e.isValid);
   if (dragon) {
+    // A flying dragon within ~16 blocks is about to charge: get out of its path (it hits for ~10).
+    const dd = Math.hypot(dragon.position.x - me.x, dragon.position.z - me.z);
+    const dHorizC = Math.hypot(dragon.position.x, dragon.position.z);
+    const flying = !(dHorizC < 6 && dragon.position.y < 80);
+    if (flying && dd < 16 && Math.abs(dragon.position.y - me.y) < 25) {
+      const away = new Vec3(me.x - dragon.position.x, 0, me.z - dragon.position.z);
+      const n = Math.max(0.1, away.norm());
+      // Sidestep (perpendicular to the dragon's approach) rather than straight back, and keep off the rim.
+      const side = new Vec3(-away.z / n, 0, away.x / n);
+      const goal = { x: me.x + side.x * 12 + (away.x / n) * 6, y: me.y, z: me.z + side.z * 12 + (away.z / n) * 6 };
+      if (Math.hypot(goal.x, goal.z) < 70) {
+        doing(bot, "dodging the dragon");
+        await goNear(bot, goal, 2, 3000, false);
+        return;
+      }
+    }
     let vel = dragonVel.get(dragon);
     if (!vel) dragonVel.set(dragon, (vel = tracker(dragon)));
     const speed = vel().norm();
@@ -1853,6 +1869,7 @@ async function step(bot: Bot): Promise<void> {
     case "end":
     case "dragon": {
       if (inEnd(bot)) {
+        endWait.delete(me);
         if (state.phase === "end") setPhase("dragon", `${me} is in the End. Shoot the crystals, hit the dragon when it lands!`);
         return fightDragon(bot, idx);
       }
@@ -1869,7 +1886,7 @@ async function step(bot: Bot): Promise<void> {
       const atPortal = onSide.filter((b) => state.endPortal && flat(b.entity.position, state.endPortal) < 30).length;
       const t0 = endWait.get(me) ?? Date.now();
       endWait.set(me, t0);
-      if (atPortal < Math.min(4, onSide.length) && Date.now() - t0 < 240_000) {
+      if (atPortal < Math.min(3, onSide.length) && Date.now() - t0 < 240_000) {
         doing(bot, `waiting for the squad at the End portal (${atPortal}/${Math.min(4, onSide.length)})`);
         await sleep(2000);
         return;
@@ -1892,6 +1909,7 @@ export function startSpeedrun(bot: Bot, brain: Pausable): void {
     .then(({ startRaceServers }) => startRaceServers(raceSnapshot))
     .catch((e) => console.warn(`[Race] ${(e as Error).message}`));
   bot.on("death", () => {
+    endWait.delete(bot.username); // wait for the squad again before the next try
     doing(bot, "died, respawning");
     // Learn from it: every later route in this dimension prices this spot up.
     const p = bot.entity?.position;
