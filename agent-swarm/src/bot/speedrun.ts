@@ -1409,6 +1409,11 @@ async function jumpIn(bot: Bot): Promise<void> {
     await goNear(bot, v(ep).offset(0, 1, 2), 3, 60_000);
     return;
   }
+  // Respawn point beside the End portal: a death in the End then costs seconds, not a
+  // 1,700-block walk from world spawn.
+  if (!inEnd(bot) && state.endPortal) {
+    await bedAtPortal(bot, { x: cell.position.x, y: cell.position.y, z: cell.position.z }).catch(() => {});
+  }
   if (await walkInto(bot, cell.position, "end_portal", () => inEnd(bot))) return;
   // Fallback: stand on the nearest frame next to the portal and walk into it.
   const frames = findFrames(bot, 48).sort((a, b) => a.distanceTo(cell.position) - b.distanceTo(cell.position));
