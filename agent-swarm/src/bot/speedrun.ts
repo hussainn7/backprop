@@ -35,6 +35,7 @@ import { currentMode } from "./hunt-mode.js";
 import { baseMoves, safeGoto } from "./navigation.js";
 import { recordDeath, dimKey } from "./danger.js";
 import { Swimmer } from "./swim.js";
+import { EscapeLearner, TACTICS, ctxKey, bucketDistance, bucketVertical, type Ctx, type Tactic } from "./escape-learner.js";
 import { abortActiveSkill, isSkillRunning } from "../skills/executor.js";
 import { ARROW, flightPath, flightTicks, solvePitch, type Projectile } from "../learn/ballistics.js";
 
@@ -392,13 +393,13 @@ const lastPearl = new Map<string, number>();
  * `dest`. The landing is chosen (solid floor, two free cells, no lava anywhere near), the pitch
  * solved with the ballistics model, and the arc traced for walls. Never from lava or water.
  */
-async function pearlHop(bot: Bot, dest: { x: number; z: number }): Promise<boolean> {
+async function pearlHop(bot: Bot, dest: { x: number; z: number }, minGap = 45): Promise<boolean> {
   if (!bot.entity || inLavaNow(bot) || new Swimmer(bot).inWater()) return false;
   if (count(bot, "ender_pearl") <= 6 || Date.now() - (lastPearl.get(bot.username) ?? 0) < 4000) return false;
   const me = bot.entity.position;
   if (bot.blockAt(me.floored().offset(0, -1, 0))?.boundingBox !== "block") return false; // not on solid ground
   const gap = Math.hypot(dest.x - me.x, dest.z - me.z);
-  if (gap < 45) return false;
+  if (gap < minGap) return false;
   const ux = (dest.x - me.x) / gap;
   const uz = (dest.z - me.z) / gap;
   const isLava = (n?: string) => !!n && /lava|magma|fire/.test(n);
@@ -2198,6 +2199,171 @@ async function unstick(bot: Bot): Promise<void> {
   }
 }
 
+// ── Learned escapes ─────────────────────────────────────────────────────────
+// When a bot has not made progress, it picks a tactic for its situation from what has worked for
+// every bot so far (see escape-learner.ts), runs it, and the outcome trains the next choice.
+let escapeLearnerInst: EscapeLearner | null = null;
+const escapeLearner = (): EscapeLearner => (escapeLearnerInst ??= new EscapeLearner());
+const posHistory = new Map<string, { at: number; p: Vec3 }[]>();
+
+function sampleHistory(bot: Bot): void {
+  const h = posHistory.get(bot.username) ?? [];
+  const last = h[h.length - 1];
+  if (!last || Date.now() - last.at > 5000) h.push({ at: Date.now(), p: bot.entity.position.clone() });
+  while (h.length > 40) h.shift();
+  posHistory.set(bot.username, h);
+}
+
+function liquidAt(bot: Bot): "none" | "water" | "lava" {
+  const f = bot.entity.position.floored();
+  for (const q of [f, f.offset(0, 1, 0)]) {
+    const n = bot.blockAt(q)?.name;
+    if (n === "lava") return "lava";
+    if (n === "water") return "water";
+  }
+  return "none";
+}
+
+function contextOf(bot: Bot, dest: Vec3 | null): Ctx {
+  const me = bot.entity.position;
+  const f = me.floored();
+  const roof = [2, 3, 4].some((dy) => bot.blockAt(f.offset(0, dy, 0))?.boundingBox === "block");
+  return {
+    dim: inNether(bot) ? "nether" : inEnd(bot) ? "end" : "overworld",
+    liquid: liquidAt(bot),
+    roof,
+    vertical: dest ? bucketVertical(dest.y - me.y) : "level",
+    distance: dest ? bucketDistance(me.distanceTo(dest)) : "near",
+  };
+}
+
+/** Flat tunnel toward a point: dig the two cells ahead, walk in, repeat. */
+async function digToward(bot: Bot, dest: Vec3, steps = 18): Promise<void> {
+  for (let i = 0; i < steps && bot.entity && currentMode() === "game"; i++) {
+    await sleep(10);
+    await guard(bot);
+    const p = bot.entity.position.floored();
+    const dx = dest.x - p.x;
+    const dz = dest.z - p.z;
+    if (Math.hypot(dx, dz) < 2) return;
+    const sx = Math.abs(dx) >= Math.abs(dz) ? Math.sign(dx) : 0;
+    const sz = sx === 0 ? Math.sign(dz) : 0;
+    const ahead = p.offset(sx, 0, sz);
+    const cells = [ahead, ahead.offset(0, 1, 0)];
+    const floor = bot.blockAt(ahead.offset(0, -1, 0));
+    const floorOk = floor?.boundingBox === "block" || /water/.test(floor?.name ?? "");
+    if (!cells.every((c) => cellSafe(bot, c)) || !floorOk) return;
+    await equip(bot, "netherite_pickaxe");
+    bot.pathfinder.setGoal(null);
+    for (const c of cells) {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const b = bot.blockAt(c);
+        if (!b || b.boundingBox !== "block") break;
+        if (bot.targetDigBlock) {
+          bot.stopDigging();
+          await sleep(120);
+        }
+        await bot.dig(b, true).catch(() => {});
+        await sleep(100);
+      }
+    }
+    if (cells.some((c) => bot.blockAt(c)?.boundingBox === "block")) return;
+    const centre = ahead.offset(0.5, 0, 0.5);
+    bot.setControlState("forward", true);
+    const t = Date.now();
+    while (Date.now() - t < 1800 && Math.hypot(bot.entity.position.x - centre.x, bot.entity.position.z - centre.z) > 0.4) {
+      await bot.lookAt(centre.offset(0, 1.2, 0), true).catch(() => {});
+      await sleep(60);
+    }
+    bot.setControlState("forward", false);
+  }
+}
+
+function availableTactics(bot: Bot, ctx: Ctx, dest: Vec3 | null): Tactic[] {
+  const out: Tactic[] = ["dig_out", "sidestep"];
+  if (dest) out.push("dig_toward");
+  if (ctx.vertical !== "down" || ctx.roof) out.push("stair_up");
+  if (ctx.vertical !== "up") out.push("stair_down");
+  if (count(bot, "cobblestone") >= 6 && ctx.liquid === "none") out.push("pillar_up");
+  if (ctx.liquid !== "none") out.push("swim_out");
+  if (dest && count(bot, "ender_pearl") > 6 && ctx.liquid === "none") out.push("pearl");
+  if ((posHistory.get(bot.username)?.length ?? 0) >= 6) out.push("backtrack");
+  return out;
+}
+
+async function runTactic(bot: Bot, tactic: Tactic, dest: Vec3 | null): Promise<void> {
+  const y = bot.entity.position.y;
+  switch (tactic) {
+    case "stair_up":
+      await ascendTo(bot, Math.min(250, Math.round(y) + 12), dest ?? undefined);
+      return;
+    case "stair_down":
+      await descendTo(bot, Math.max(-60, Math.round(y) - 12));
+      return;
+    case "pillar_up":
+      await pillarUp(bot, Math.round(y) + 8);
+      return;
+    case "swim_out":
+      await swimOutOfLava(bot, dest ?? bot.entity.position, y);
+      return;
+    case "pearl":
+      if (dest) await pearlHop(bot, dest, 12);
+      return;
+    case "dig_toward":
+      if (dest) await digToward(bot, dest);
+      return;
+    case "dig_out":
+      await unstick(bot);
+      return;
+    case "sidestep": {
+      const a = Math.random() * Math.PI * 2;
+      const p = bot.entity.position;
+      await goNear(bot, { x: p.x + Math.cos(a) * 14, y: p.y, z: p.z + Math.sin(a) * 14 }, 3, 12_000, true);
+      return;
+    }
+    case "backtrack": {
+      const h = posHistory.get(bot.username) ?? [];
+      const old = h[Math.max(0, h.length - 7)];
+      if (old) await goNear(bot, old.p, 3, 20_000, true);
+      return;
+    }
+  }
+}
+
+/** Stuck: choose a tactic by what has worked before, run it, and score the outcome. */
+async function escapeStuck(bot: Bot): Promise<void> {
+  const learner = escapeLearner();
+  const d = destOf.get(bot.username);
+  const dest = d && Date.now() - d.at < 90_000 ? d.p : null;
+  const ctx = contextOf(bot, dest);
+  const key = ctxKey(ctx);
+  const tactic = learner.choose(ctx, availableTactics(bot, ctx, dest) as readonly Tactic[]);
+  const p0 = bot.entity.position.clone();
+  const d0 = dest ? p0.distanceTo(dest) : 0;
+  const t0 = Date.now();
+  let died = false;
+  const onDeath = () => {
+    died = true;
+  };
+  bot.once("death", onDeath);
+  doing(bot, `unstuck attempt: ${tactic}`);
+  console.log(`[Escape] ${bot.username} stuck at ${p0.floored()} ctx=${key} -> ${tactic}`);
+  try {
+    await runTactic(bot, tactic, dest);
+  } catch (err) {
+    console.warn(`[Escape] ${bot.username} ${tactic} threw: ${(err as Error).message}`);
+  }
+  bot.removeListener("death", onDeath);
+  const p1 = bot.entity?.position;
+  const moved = p1 ? p1.distanceTo(p0) : 0;
+  const closer = dest && p1 ? d0 - p1.distanceTo(dest) : moved;
+  const left = ctx.liquid !== "none" && p1 && liquidAt(bot) === "none" ? 0.5 : 0;
+  const secs = (Date.now() - t0) / 1000;
+  const reward = Math.max(-1, Math.min(1, closer / 10)) + left - secs / 90 - (died ? 1.5 : 0);
+  learner.record(key, tactic, reward);
+  console.log(`[Escape] ${bot.username} ${tactic}: moved ${moved.toFixed(0)}, ${closer >= 0 ? "closer" : "farther"} by ${Math.abs(closer).toFixed(0)}, ${secs.toFixed(0)}s, reward ${reward.toFixed(2)}${died ? " (died)" : ""}`);
+}
+
 // ── Per-bot driver ──────────────────────────────────────────────────────────
 interface Pausable {
   pause(): void;
@@ -2662,10 +2828,13 @@ export function startSpeedrun(bot: Bot, brain: Pausable): void {
       state.phase === "eyes" ||
       nearLeader ||
       (state.phase === "blaze" && !!state.spawner && pos.distanceTo(v(state.spawner)) < 10);
-    if (!waiting && Date.now() - anchor.at > 90_000) {
+    const dtext = doingMap.get(bot.username)?.text ?? "";
+    const intentional = waiting || /waiting|crafting|handed|throwing|setting a respawn|unstuck/.test(dtext);
+    sampleHistory(bot);
+    if (!intentional && Date.now() - anchor.at > Number(process.env.ESCAPE_STUCK_MS || 25_000)) {
       anchor = { p: pos.clone(), at: Date.now() };
       busy = true;
-      void unstick(bot).finally(() => (busy = false));
+      void escapeStuck(bot).finally(() => (busy = false));
       return;
     }
     // The leader posts squad status every two minutes.
