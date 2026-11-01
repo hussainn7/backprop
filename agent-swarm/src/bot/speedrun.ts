@@ -1125,6 +1125,14 @@ async function huntBlazes(bot: Bot): Promise<void> {
   if (bot.entity.position.y < f.y - 6) {
     console.log(`[Speedrun] ${bot.username}: ${Math.round(f.y - bot.entity.position.y)} blocks below the fortress, climbing`);
     await talk(bot, "climb", `Under the fortress, climbing up to it`, 60_000);
+    // First try the pathfinder for short climbs; for anything real, dig a stair up.
+    if (bot.entity.position.y < f.y - 12) {
+      if (!(await ascendTo(bot, f.y))) {
+        const a = Math.random() * Math.PI * 2;
+        await goNear(bot, { x: bot.entity.position.x + Math.cos(a) * 8, y: bot.entity.position.y, z: bot.entity.position.z + Math.sin(a) * 8 }, 2, 15_000, true);
+      }
+      return;
+    }
     await goNear(bot, { x: f.x, y: f.y + 1, z: f.z }, 3, 45_000, true);
     return;
   }
@@ -1439,6 +1447,84 @@ async function descendTo(bot: Bot, targetY: number): Promise<boolean> {
   const y = Math.round(bot.entity.position.y);
   console.log(`[Speedrun] ${bot.username}: stair dug to y=${y} in ${i} steps${aborted ? ` (stopped: ${aborted})` : ""}`);
   return bot.entity.position.y <= targetY + 1;
+}
+
+/**
+ * Dig a spiral staircase UP to `targetY` where the bot stands (mirror of descendTo). The
+ * pathfinder will not plan a 30+ block climb through rock, which left whole squads parked
+ * under the fortress. Each step keeps the block it will stand on, clears two cells of
+ * headroom, refuses lava, and never opens into liquid above.
+ */
+async function ascendTo(bot: Bot, targetY: number): Promise<boolean> {
+  const until = Date.now() + 240_000;
+  let i = 0;
+  let failures = 0;
+  let aborted = "";
+  doing(bot, `digging up to y=${targetY} (${Math.round(targetY - bot.entity.position.y)} to go)`);
+  while (bot.entity && bot.entity.position.y < targetY - 1 && Date.now() < until && currentMode() === "game") {
+    const p = bot.entity.position.floored();
+    const [dx, dz] = SPIRAL[i % SPIRAL.length];
+    const ahead = p.offset(dx, 0, dz);
+    const step = ahead; // solid block we climb onto
+    const clear = [ahead.offset(0, 1, 0), ahead.offset(0, 2, 0), p.offset(0, 2, 0)];
+    const stepBlock = bot.blockAt(step);
+    const stepOk = stepBlock?.boundingBox === "block" && !HAZARD.test(stepBlock.name) && !/sand|gravel/.test(stepBlock.name);
+    if (!stepOk || !clear.every((c) => cellSafe(bot, c))) {
+      if (++failures >= 6) {
+        aborted = `no safe step at ${ahead} (${stepBlock?.name})`;
+        break;
+      }
+      i++; // try the next side of the ring
+      continue;
+    }
+    await equip(bot, "netherite_pickaxe");
+    bot.pathfinder.setGoal(null);
+    for (const c of clear) {
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const b = bot.blockAt(c);
+        if (!b || b.boundingBox !== "block") break;
+        if (bot.targetDigBlock) {
+          bot.stopDigging();
+          await sleep(150);
+        }
+        await bot.dig(b, true).catch(() => {});
+        await sleep(120);
+      }
+    }
+    if (clear.some((c) => bot.blockAt(c)?.boundingBox === "block")) {
+      if (++failures >= 6) {
+        aborted = `cannot clear ${clear.find((c) => bot.blockAt(c)?.boundingBox === "block")}`;
+        break;
+      }
+      continue;
+    }
+    // Jump forward onto the step.
+    const centre = ahead.offset(0.5, 1, 0.5);
+    bot.setControlState("forward", true);
+    bot.setControlState("jump", true);
+    const t = Date.now();
+    while (Date.now() - t < 2500) {
+      await bot.lookAt(centre.offset(0, 0.6, 0), true).catch(() => {});
+      const q = bot.entity.position;
+      if (Math.hypot(q.x - centre.x, q.z - centre.z) < 0.4 && q.y >= p.y + 0.9) break;
+      await sleep(60);
+    }
+    bot.setControlState("jump", false);
+    bot.setControlState("forward", false);
+    if (bot.entity.position.y < p.y + 0.5) {
+      if (++failures >= 6) {
+        aborted = `stuck at ${p}`;
+        break;
+      }
+      continue;
+    }
+    failures = 0;
+    i++;
+    await topUp(bot);
+  }
+  bot.clearControlStates();
+  console.log(`[Speedrun] ${bot.username}: climbed to y=${Math.round(bot.entity.position.y)} in ${i} steps${aborted ? ` (stopped: ${aborted})` : ""}`);
+  return bot.entity.position.y >= targetY - 1;
 }
 
 async function fillPortal(bot: Bot): Promise<void> {
