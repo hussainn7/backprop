@@ -1216,7 +1216,7 @@ async function digDownToward(bot: Bot, y: number): Promise<void> {
 const SPIRAL: [number, number][] = [
   [1, 0], [1, 0], [0, 1], [0, 1], [-1, 0], [-1, 0], [0, -1], [0, -1],
 ];
-const HAZARD = /lava|water|magma|fire|spawner|bubble/;
+const HAZARD = /lava|magma|fire|spawner/; // water is only an obstacle; lava kills
 
 /** True when digging at `c` (and standing there) is safe: no liquids around, solid floor below. */
 function cellSafe(bot: Bot, c: Vec3): boolean {
@@ -1246,7 +1246,9 @@ async function descendTo(bot: Bot, targetY: number): Promise<boolean> {
     const ahead = p.offset(dx, 0, dz);
     const cells = [ahead.offset(0, 1, 0), ahead, ahead.offset(0, -1, 0)];
     const floor = ahead.offset(0, -2, 0);
-    if (!cells.every((c) => cellSafe(bot, c)) || bot.blockAt(floor)?.boundingBox !== "block") {
+    const floorBlock = bot.blockAt(floor);
+    const floorOk = floorBlock?.boundingBox === "block" || /water/.test(floorBlock?.name ?? "");
+    if (!cells.every((c) => cellSafe(bot, c)) || !floorOk) {
       aborted = `unsafe step at ${ahead} (floor ${bot.blockAt(floor)?.name})`;
       break;
     }
