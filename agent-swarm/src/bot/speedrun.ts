@@ -1230,7 +1230,7 @@ async function fillPortal(bot: Bot): Promise<void> {
     const held = squadBots()
       .filter((b) => b !== bot)
       .reduce((n, b) => n + count(b, "ender_eye"), 0);
-    if (held === 0) {
+    if (confirmedGone("portal-short", held === 0)) {
       state.rodTarget = squadCount("blaze_rod") + Math.ceil(short / 2) + 1;
       save();
       setPhase("nether", `${short} eyes short for the portal; back to the Nether for more rods`);
@@ -1351,6 +1351,24 @@ async function fightDragon(bot: Bot, index: number): Promise<void> {
     await defend(bot, 4);
     await sleep(800);
   }
+}
+
+/**
+ * Giving up (sending the squad back to the Nether) is expensive and wrong when
+ * the "missing" items are just carried by a bot that is offline for a moment
+ * (restart, rejoin). Only trust the condition when all five bots are online and
+ * it has held for 90 s without a break.
+ */
+const giveUpSince = new Map<string, number>();
+function confirmedGone(key: string, cond: boolean): boolean {
+  const everyone = squadBots().filter((b) => b.entity).length >= 5;
+  if (!cond || !everyone) {
+    giveUpSince.delete(key);
+    return false;
+  }
+  const t = giveUpSince.get(key) ?? Date.now();
+  giveUpSince.set(key, t);
+  return Date.now() - t > 90_000;
 }
 
 // ── Team talk and self-recovery ─────────────────────────────────────────────
@@ -1551,7 +1569,7 @@ async function step(bot: Bot): Promise<void> {
         const eyes = count(bot, "ender_eye");
         if (eyes >= PORTAL_EYES + 2 && (!pending || since > 120_000)) setPhase("stronghold", `${eyes} eyes of ender in hand. Throwing the first one!`);
         else if (eyes > 0 && !pending) setPhase("stronghold", `${eyes} eyes of ender in hand. Throwing the first one!`);
-        else if (eyes === 0 && !pending && !squadCount("blaze_rod") && !squadCount("blaze_powder")) {
+        else if (confirmedGone("eyes-gone", eyes === 0 && !pending && !squadCount("blaze_rod") && !squadCount("blaze_powder"))) {
           state.rodTarget = 8;
           save();
           setPhase("nether", "no rods or eyes left in the squad; back to the Nether");
@@ -1571,7 +1589,7 @@ async function step(bot: Bot): Promise<void> {
           setPhase("eyes", `${me} has no eyes; squad, bring rods and eyes to me`);
           return;
         }
-        if (!count(bot, "ender_eye") && !state.stronghold?.exact && !findFrames(bot).length) {
+        if (confirmedGone("lead-no-eyes", !count(bot, "ender_eye") && !squadCount("ender_eye") && !squadCount("blaze_rod") && !state.stronghold?.exact && !findFrames(bot).length)) {
           state.rodTarget = 8;
           save();
           setPhase("nether", "no eyes and no rods left in the squad; back to the Nether for rods");
