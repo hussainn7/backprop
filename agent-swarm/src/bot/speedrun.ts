@@ -2152,10 +2152,16 @@ async function jumpIn(bot: Bot): Promise<void> {
 
 // ── The End ─────────────────────────────────────────────────────────────────
 function exitPortalOpen(bot: Bot): boolean {
-  const id = bot.registry.blocksByName.end_portal?.id;
-  if (id === undefined) return false;
-  const b = throttled(`exit:${bot.username}`, 5000, () => bot.findBlock({ matching: id, maxDistance: 160 }));
-  return !!b && Math.hypot(b.position.x, b.position.z) < 8;
+  // The exit portal always forms on the fountain at the world origin. Checking those few columns directly
+  // is instant; bot.findBlock over 160 blocks took 150 SECONDS per call in the End and froze every bot in
+  // the process (and the ones trying to enter the portal) for minutes at a time.
+  if (!inEnd(bot)) return false;
+  return throttled(`exit:${bot.username}`, 3000, () => {
+    for (let y = 50; y <= 100; y++)
+      for (let dx = -2; dx <= 2; dx++)
+        for (let dz = -2; dz <= 2; dz++) if (bot.blockAt(new Vec3(dx, y, dz))?.name === "end_portal") return true;
+    return false;
+  });
 }
 
 /**
