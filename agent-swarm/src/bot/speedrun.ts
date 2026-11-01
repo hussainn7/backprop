@@ -458,6 +458,7 @@ async function pearlHop(bot: Bot, dest: { x: number; z: number }, minGap = 45): 
 /** Where each bot is currently trying to get to; the swimmer steers by it while in water. */
 const destOf = new Map<string, { p: Vec3; at: number }>();
 const shoreAt = new Map<string, { at: number; p: Vec3 | null }>();
+const waterSince = new Map<string, number>();
 function setDest(bot: Bot, p: { x: number; y?: number; z: number }): void {
   destOf.set(bot.username, { p: new Vec3(p.x, p.y ?? bot.entity.position.y, p.z), at: Date.now() });
 }
@@ -2208,6 +2209,117 @@ async function unstick(bot: Bot): Promise<void> {
   }
 }
 
+// ── Boats ───────────────────────────────────────────────────────────────────
+// Swimming is ~3 blocks/s; a boat is ~8. The bot library only sends steering input and the client is
+// what moves a boat, so the bot sends the movement itself (vehicle_move). If the server does not accept
+// it (the boat does not actually travel), boats are switched off for everyone for half an hour.
+const BOAT_OFF_FILE = path.join("logs", "learning", "boat-disabled.txt");
+function boatsDisabled(): boolean {
+  try {
+    return Date.now() - Number(fs.readFileSync(BOAT_OFF_FILE, "utf8")) < 1_800_000;
+  } catch {
+    return false;
+  }
+}
+function disableBoats(why: string): void {
+  console.log(`[Speedrun] boats disabled for 30 min: ${why}`);
+  try {
+    fs.mkdirSync(path.dirname(BOAT_OFF_FILE), { recursive: true });
+    fs.writeFileSync(BOAT_OFF_FILE, String(Date.now()));
+  } catch {
+    /* best effort */
+  }
+}
+const boating = new Set<string>();
+const vehicleOf = (b: Bot): Entity | null => (b as unknown as { vehicle?: Entity | null }).vehicle ?? null;
+const lastBoat = new Map<string, number>();
+
+async function boatTravel(bot: Bot, dest: Vec3): Promise<boolean> {
+  if (boating.has(bot.username) || boatsDisabled() || !count(bot, "oak_boat")) return false;
+  if (Date.now() - (lastBoat.get(bot.username) ?? 0) < 60_000) return false;
+  lastBoat.set(bot.username, Date.now());
+  boating.add(bot.username);
+  const raw = bot._client as unknown as { write: (name: string, params: unknown) => void };
+  let boat: Entity | null = null;
+  try {
+    const me = bot.entity.position;
+    const dx = dest.x - me.x;
+    const dz = dest.z - me.z;
+    const len = Math.hypot(dx, dz) || 1;
+    if (!(await equip(bot, "oak_boat"))) return false;
+    bot.pathfinder.setGoal(null);
+    bot.clearControlStates();
+    await bot.lookAt(new Vec3(me.x + (dx / len) * 2.5, me.y - 0.3, me.z + (dz / len) * 2.5), true).catch(() => {});
+    bot.activateItem();
+    await sleep(700);
+    boat = bot.nearestEntity((e) => /boat/.test(e.name ?? "") && e.position.distanceTo(bot.entity.position) < 6) ?? null;
+    if (!boat) {
+      console.log(`[Speedrun] ${bot.username}: no boat appeared`);
+      return false;
+    }
+    bot.mount(boat);
+    await sleep(600);
+    if (!vehicleOf(bot)) {
+      console.log(`[Speedrun] ${bot.username}: could not mount the boat`);
+      return false;
+    }
+    doing(bot, "sailing a boat across the water");
+    let pos = boat.position.clone();
+    const start = pos.clone();
+    const t0 = Date.now();
+    let checked = false;
+    while (vehicleOf(bot) && Date.now() - t0 < 150_000 && currentMode() === "game" && bot.health > 0) {
+      const ddx = dest.x - pos.x;
+      const ddz = dest.z - pos.z;
+      const gap = Math.hypot(ddx, ddz);
+      if (gap < 12) break;
+      const hx = ddx / gap;
+      const hz = ddz / gap;
+      const next = new Vec3(pos.x + hx * 0.4, pos.y, pos.z + hz * 0.4);
+      const f = next.floored();
+      const wet = (q: Vec3) => /water/.test(bot.blockAt(q)?.name ?? "");
+      if (!(wet(f) || wet(f.offset(0, -1, 0)))) break; // shore ahead
+      raw.write("vehicle_move", { x: next.x, y: next.y, z: next.z, yaw: (Math.atan2(-hx, hz) * 180) / Math.PI, pitch: 0, onGround: false });
+      raw.write("steer_boat", { leftPaddle: true, rightPaddle: true });
+      pos = next;
+      await sleep(50);
+      if (!checked && Date.now() - t0 > 6000) {
+        checked = true;
+        // Did the server really move the boat? Its position (from the server) must be near ours.
+        const real = boat.position.distanceTo(start);
+        if (real < 15 || boat.position.distanceTo(pos) > 8) {
+          disableBoats(`the boat only moved ${Math.round(real)} blocks of the ${Math.round(pos.distanceTo(start))} sent`);
+          break;
+        }
+      }
+    }
+    const sailed = pos.distanceTo(start);
+    const secs = (Date.now() - t0) / 1000;
+    if (sailed > 20) console.log(`[Speedrun] ${bot.username}: boat sailed ${Math.round(sailed)} blocks in ${Math.round(secs)} s (${(sailed / Math.max(1, secs)).toFixed(1)} blocks/s)`);
+    return sailed > 20;
+  } catch (err) {
+    console.warn(`[Speedrun] ${bot.username}: boat failed: ${(err as Error).message}`);
+    return false;
+  } finally {
+    try {
+      if (vehicleOf(bot)) bot.dismount();
+      await sleep(400);
+      if (boat?.isValid) {
+        for (let i = 0; i < 5 && boat.isValid; i++) {
+          if (boat.position.distanceTo(bot.entity.position) > 4) break;
+          await bot.lookAt(boat.position, true).catch(() => {});
+          bot.attack(boat);
+          await sleep(350);
+        }
+        await pickUpNear(bot, ["oak_boat"], 8, 3000);
+      }
+    } catch {
+      /* best effort */
+    }
+    boating.delete(bot.username);
+  }
+}
+
 // ── Learned escapes ─────────────────────────────────────────────────────────
 // When a bot has not made progress, it picks a tactic for its situation from what has worked for
 // every bot so far (see escape-learner.ts), runs it, and the outcome trains the next choice.
@@ -2684,6 +2796,7 @@ export function startSpeedrun(bot: Bot, brain: Pausable): void {
   const swimTimer = setInterval(() => {
     if (!bot.entity || bot.health <= 0 || currentMode() !== "game") return;
     if (!swimmer.inWater() || inLavaNow(bot)) {
+      if (!boating.has(bot.username)) waterSince.delete(bot.username);
       if (swimActive) {
         swimActive = false;
         swimmer.stop();
@@ -2692,6 +2805,20 @@ export function startSpeedrun(bot: Bot, brain: Pausable): void {
     }
     // Always in charge while in water (a bot with no destination used to just drown): head for
     // its destination when it has one, otherwise the nearest shore, otherwise straight up.
+    if (boating.has(bot.username)) return; // sailing: the boat code is in charge
+    if (!waterSince.has(bot.username)) waterSince.set(bot.username, Date.now());
+    const dFar = destOf.get(bot.username);
+    if (
+      dFar &&
+      Date.now() - dFar.at < 60_000 &&
+      Date.now() - waterSince.get(bot.username)! > 4000 &&
+      flat(bot.entity.position, dFar.p) > 60 &&
+      count(bot, "oak_boat") &&
+      !boatsDisabled()
+    ) {
+      void boatTravel(bot, dFar.p);
+      return;
+    }
     const d = destOf.get(bot.username);
     let target: Vec3;
     if (d && Date.now() - d.at <= 90_000) target = d.p;

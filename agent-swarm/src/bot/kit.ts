@@ -102,6 +102,12 @@ export function startKitKeeper(squadBots: string[]): void {
               console.log(`[Kit] ${n}: enchanted golden apples ${have} -> 8`);
             }
           }
+          // A boat per bot: ~8 blocks/s on water against ~3 swimming.
+          const bt: string = await rcon.send(`clear ${n} minecraft:oak_boat 0`);
+          if (!/No player was found|No entity was found/.test(bt) && !/Found [1-9]\d* matching/.test(bt)) {
+            await rcon.send(`give ${n} minecraft:oak_boat 1`);
+            console.log(`[Kit] ${n}: oak_boat`);
+          }
           const pick: string = await rcon.send(`clear ${n} minecraft:netherite_pickaxe 0`);
           if (!/Found [1-9]\d* matching/.test(pick)) {
             for (const cmd of SPEEDRUN(n)) await rcon.send(cmd);
