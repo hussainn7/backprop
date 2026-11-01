@@ -102,6 +102,15 @@ export function startKitKeeper(squadBots: string[]): void {
               console.log(`[Kit] ${n}: enchanted golden apples ${have} -> 8`);
             }
           }
+          // Respawn beds (portal, stronghold, End portal): keep 3 on hand.
+          const bd: string = await rcon.send(`clear ${n} minecraft:white_bed 0`);
+          if (!/No player was found|No entity was found/.test(bd)) {
+            const haveBeds = Number(bd.match(/Found (\d+)/)?.[1] ?? 0);
+            if (haveBeds < 2) {
+              await rcon.send(`give ${n} minecraft:white_bed ${3 - haveBeds}`);
+              console.log(`[Kit] ${n}: white_bed ${haveBeds} -> 3`);
+            }
+          }
           // A boat per bot: ~8 blocks/s on water against ~3 swimming.
           const bt: string = await rcon.send(`clear ${n} minecraft:oak_boat 0`);
           if (!/No player was found|No entity was found/.test(bt) && !/Found [1-9]\d* matching/.test(bt)) {

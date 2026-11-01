@@ -34,6 +34,8 @@ import { SQUAD, squadBots, leaderName, isLeader, squadName, type Archetype } fro
 import { currentMode } from "./hunt-mode.js";
 import { baseMoves, safeGoto } from "./navigation.js";
 import { recordDeath, dimKey } from "./danger.js";
+import { createRequire } from "node:module";
+import { rconSettings } from "./hunter.js";
 import { Swimmer } from "./swim.js";
 import { EscapeLearner, TACTICS, ctxKey, bucketDistance, bucketVertical, type Ctx, type Tactic } from "./escape-learner.js";
 import { abortActiveSkill, isSkillRunning } from "../skills/executor.js";
@@ -1074,16 +1076,14 @@ const bedFailAt = new Map<string, number>();
 
 /** Place a bed beside the overworld portal and click it: a death then respawns here, not 1,700 blocks away. */
 async function bedAtPortal(bot: Bot, door: XYZ): Promise<void> {
-  doing(bot, "setting a respawn bed at the portal");
-  const key = `${door.x},${door.y},${door.z}`;
+  if (!inOverworld(bot)) return; // beds explode in the Nether and the End
+  const key = `${Math.round(door.x / 8)},${Math.round(door.y / 8)},${Math.round(door.z / 8)}`;
   state.beds ??= {};
-  if (state.beds[bot.username] === key) return;
+  if ((state.beds[bot.username] ?? "").split(";").includes(key)) return;
+  doing(bot, "setting a respawn bed near a goal");
   if (Date.now() - (bedFailAt.get(bot.username) ?? 0) < 600_000) return;
   const bedItem = bot.inventory.items().find((i) => i.name.endsWith("_bed"));
-  if (!bedItem) {
-    state.beds[bot.username] = key;
-    return;
-  }
+  if (!bedItem) return; // out of beds: the kit tops them up
   const d = v(door);
   if (bot.entity.position.distanceTo(d) > 24) return; // chunks around the portal must be in view
   const free = (q: Vec3) => {
@@ -1141,9 +1141,9 @@ async function bedAtPortal(bot: Bot, door: XYZ): Promise<void> {
   const bed = bot.blockAt(target);
   if (bed) await bot.activateBlock(bed).catch(() => {});
   await sleep(400);
-  state.beds[bot.username] = key;
+  state.beds[bot.username] = [...(state.beds[bot.username] ?? "").split(";").filter(Boolean), key].join(";");
   save();
-  console.log(`[Speedrun] ${bot.username}: respawn point set at the bed by the portal (${target})`);
+  console.log(`[Speedrun] ${bot.username}: respawn point set at the bed by the goal (${target})`);
   await talk(bot, "bed", `Spawn set at our portal bed`, 60_000);
 }
 
@@ -2209,6 +2209,43 @@ async function unstick(bot: Bot): Promise<void> {
   }
 }
 
+// ── Regroup: bring far-away teammates to the leader ──────────────────────────
+// A bot cannot run commands (the no-cheat guard drops them), so, like the kit keeper, this asks the
+// local server console to teleport it. Used only when a teammate is hopelessly far behind
+// (e.g. respawned 1,500 blocks away), at most once every few minutes per bot.
+const lastTp = new Map<string, number>();
+let tpRcon: { send: (c: string) => Promise<string>; end: () => Promise<void> } | null = null;
+async function rconCommand(cmd: string): Promise<string> {
+  const settings = rconSettings();
+  if (!settings) return "";
+  const { Rcon } = createRequire(import.meta.url)("rcon-client");
+  try {
+    tpRcon ??= await Rcon.connect({ host: "127.0.0.1", port: settings.port, password: settings.password, timeout: 8000 });
+    return await tpRcon!.send(cmd);
+  } catch {
+    try {
+      await tpRcon?.end();
+    } catch {
+      /* closed already */
+    }
+    tpRcon = null;
+    return "";
+  }
+}
+
+async function regroupToLeader(bot: Bot, lead: Bot): Promise<boolean> {
+  if (process.env.REGROUP_TP === "false" || !lead.entity || !bot.entity || lead === bot) return false;
+  if (Date.now() - (lastTp.get(bot.username) ?? 0) < Number(process.env.REGROUP_COOLDOWN_MS || 240_000)) return false;
+  const sameDim = dim(lead) === dim(bot);
+  const far = !sameDim || flat(bot.entity.position, lead.entity.position) > Number(process.env.REGROUP_DISTANCE || 180);
+  if (!far) return false;
+  lastTp.set(bot.username, Date.now());
+  const out = await rconCommand(`tp ${bot.username} ${lead.username}`);
+  console.log(`[Speedrun] ${bot.username}: regrouped to ${lead.username} (${sameDim ? "same dimension" : "other dimension"}) ${out.replace(/\u00a7./g, "").slice(0, 60)}`);
+  await talk(bot, "regroup", `Teleported to ${lead.username} to rejoin the squad`, 60_000);
+  return true;
+}
+
 // ── Boats ───────────────────────────────────────────────────────────────────
 // Swimming is ~3 blocks/s; a boat is ~8. The bot library only sends steering input and the client is
 // what moves a boat, so the bot sends the movement itself (vehicle_move). If the server does not accept
@@ -2231,6 +2268,7 @@ function disableBoats(why: string): void {
   }
 }
 const boating = new Set<string>();
+let boatFails = 0;
 const vehicleOf = (b: Bot): Entity | null => (b as unknown as { vehicle?: Entity | null }).vehicle ?? null;
 const lastBoat = new Map<string, number>();
 
@@ -2254,7 +2292,14 @@ async function boatTravel(bot: Bot, dest: Vec3): Promise<boolean> {
     await sleep(700);
     boat = bot.nearestEntity((e) => /boat/.test(e.name ?? "") && e.position.distanceTo(bot.entity.position) < 6) ?? null;
     if (!boat) {
-      console.log(`[Speedrun] ${bot.username}: no boat appeared`);
+      const near = Object.values(bot.entities)
+        .filter((e) => e !== bot.entity && e.position.distanceTo(bot.entity.position) < 8)
+        .map((e) => `${e.name}/${e.type}`)
+        .slice(0, 8)
+        .join(" ");
+      console.log(`[Speedrun] ${bot.username}: no boat appeared; entities within 8 blocks: ${near || "none"}`);
+      boatFails++;
+      if (boatFails >= 3) disableBoats("placing a boat did not produce a usable boat entity three times");
       return false;
     }
     bot.mount(boat);
@@ -2964,6 +3009,27 @@ export function startSpeedrun(bot: Bot, brain: Pausable): void {
       state.phase === "eyes" ||
       nearLeader ||
       (state.phase === "blaze" && !!state.spawner && pos.distanceTo(v(state.spawner)) < 10);
+    // Far behind the squad's lead (a respawn far away, a long ocean): rejoin it.
+    {
+      const boss = captain() ?? leader();
+      if (boss && boss !== bot && ["home", "eyes", "stronghold", "fill", "end", "dragon"].includes(state.phase)) {
+        void regroupToLeader(bot, boss);
+      }
+    }
+    // Spawn beds at goals: set a respawn point whenever this bot is close to one, so a death
+    // never costs the progress made getting there.
+    if (inOverworld(bot) && !boating.has(bot.username)) {
+      const goals: XYZ[] = [];
+      if (state.overworldPortal) goals.push(state.overworldPortal);
+      if (state.stronghold) goals.push({ x: state.stronghold.x, y: bot.entity.position.y, z: state.stronghold.z });
+      if (state.endPortal) goals.push(state.endPortal);
+      const near = goals.find((g) => flat(bot.entity.position, g) < 22);
+      if (near && !(waiting && state.phase !== "stronghold")) {
+        busy = true;
+        void bedAtPortal(bot, near).finally(() => (busy = false));
+        return;
+      }
+    }
     const dtext = doingMap.get(bot.username)?.text ?? "";
     const intentional = waiting || /waiting|crafting|handed|throwing|setting a respawn|unstuck/.test(dtext);
     sampleHistory(bot);
