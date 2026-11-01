@@ -5,7 +5,9 @@
 // a netherite sword, a bow with arrows, food, golden apples, totems, pearls
 // and cobblestone. Every 20 s each squad process checks its own kitted bots
 // over local RCON and re-applies the kit when the chestplate or the sword is
-// missing (a fresh bot, or gear lost some other way).
+// missing (a fresh bot, or gear lost some other way). Every bot of the squad,
+// kitted or not, also gets a bow and arrows if it has no bow (BOWS_FOR_ALL,
+// default on): the learned "shoot" tactic needs one.
 
 import { createRequire } from "node:module";
 import { rconSettings } from "./hunter.js";
@@ -38,9 +40,15 @@ export function kitBots(squadBots: string[]): string[] {
   return squadBots.filter((b) => wanted.has(b.toLowerCase()));
 }
 
+const BOW = (n: string): string[] => [
+  `give ${n} minecraft:bow[minecraft:enchantments={levels:{"minecraft:power":5,"minecraft:punch":2,"minecraft:flame":1,"minecraft:infinity":1}},minecraft:unbreakable={}] 1`,
+  `give ${n} minecraft:arrow 64`,
+];
+
 export function startKitKeeper(squadBots: string[]): void {
   const names = kitBots(squadBots);
-  if (started || !names.length) return;
+  const bows = process.env.BOWS_FOR_ALL !== "false" ? squadBots : [];
+  if (started || (!names.length && !bows.length)) return;
   started = true;
   const settings = rconSettings();
   if (!settings) {
@@ -60,6 +68,12 @@ export function startKitKeeper(squadBots: string[]): void {
         if (hasChest && hasSword) continue;
         for (const cmd of KIT(n)) await rcon.send(cmd);
         console.log(`[Kit] ${n}: full loadout applied (${hasChest ? "" : "no armor"}${!hasChest && !hasSword ? ", " : ""}${hasSword ? "" : "no sword"})`);
+      }
+      for (const n of bows) {
+        const bow: string = await rcon.send(`clear ${n} minecraft:bow 0`);
+        if (/No player was found|No entity was found/.test(bow) || /Found [1-9]\d* matching/.test(bow)) continue;
+        for (const cmd of BOW(n)) await rcon.send(cmd);
+        console.log(`[Kit] ${n}: bow and arrows`);
       }
       await rcon.end();
     } catch (err) {

@@ -117,3 +117,18 @@ test("backup is offered only when a teammate called for help, and old weights su
   const learner = new CombatLearner("old", dir);
   assert.equal(learner.q(s, "rush"), 0.5 * 6, "21 learned weights kept (6 active features here), new one starts at 0");
 });
+
+test("arrow ballistics: solved pitch passes the target, including straight up a tower", async () => {
+  const { ARROW, solvePitch, heightAt } = await import("./ballistics.js");
+  for (const [d, dy] of [
+    [10, 1.2],
+    [30, 1.2],
+    [50, 0],
+    [6, 30], // under a 30-block tower
+  ]) {
+    const p = solvePitch(ARROW, d, dy);
+    assert.ok(p !== null, `no shot for d=${d} dy=${dy}`);
+    assert.ok(Math.abs(heightAt(ARROW, p!, d)! - dy) < 0.05, `d=${d} dy=${dy}`);
+  }
+  assert.equal(solvePitch(ARROW, 40, 200), null, "out of reach");
+});

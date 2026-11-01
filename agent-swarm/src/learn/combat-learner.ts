@@ -24,7 +24,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-export const TACTICS = ["rush", "crit", "wtap", "shield", "strafe", "retreat", "pearl_close", "pearl_escape", "defend", "backup"] as const;
+export const TACTICS = ["rush", "crit", "wtap", "shield", "strafe", "retreat", "pearl_close", "pearl_escape", "defend", "backup", "shoot"] as const;
 export type Tactic = (typeof TACTICS)[number];
 
 export const TACTIC_INFO: Record<Tactic, string> = {
@@ -38,6 +38,7 @@ export const TACTIC_INFO: Record<Tactic, string> = {
   pearl_escape: "throw an ender pearl away from the target",
   defend: "turn on the hostile mob hitting you and kill it",
   backup: "run to a teammate who called for help and fight beside them",
+  shoot: "full-draw bow shot, leading him by his velocity (reaches towers)",
 };
 
 export type TargetMotion = "still" | "approaching" | "fleeing";
@@ -122,7 +123,7 @@ export function stateKey(s: CombatState): string {
 }
 
 /** Tactics that are physically possible in a state with the bot's current kit. Which is GOOD is learned. */
-export function availableTactics(s: CombatState, pearls: number, hasShield: boolean): Tactic[] {
+export function availableTactics(s: CombatState, pearls: number, hasShield: boolean, canShoot = false): Tactic[] {
   return TACTICS.filter((t) => {
     if (t === "pearl_close") return pearls > 0 && s.dist >= 8 && s.dist <= 40;
     if (t === "pearl_escape") return pearls > 0 && s.hp <= 8 && s.dist <= 8;
@@ -130,6 +131,7 @@ export function availableTactics(s: CombatState, pearls: number, hasShield: bool
     if (t === "crit" || t === "wtap" || t === "strafe") return s.dist <= 8;
     if (t === "defend") return !!s.mobAdjacent;
     if (t === "backup") return !!s.allyHurt;
+    if (t === "shoot") return canShoot && s.dist >= 4 && s.dist <= 60;
     return true;
   });
 }
@@ -259,7 +261,7 @@ export class CombatLearner {
         ] as const
       ).map(([situation, extra]) => {
         const s: CombatState = { dist, hp: 20, targetShielding: false, dy: 0, ...extra };
-        const opts = availableTactics(s, 16, true);
+        const opts = availableTactics(s, 16, true, true);
         const best = opts.reduce((x, y) => (this.q(s, y) > this.q(s, x) ? y : x));
         return { dist: label, situation, tactic: this.m.updates ? best : null, q: this.m.updates ? this.q(s, best) : null };
       });

@@ -26,6 +26,7 @@ import { say, fmt, requestHelp, clearHelp, helpRequests } from "./team-comms.js"
 import { Pursuit } from "./pursuit.js";
 import { isHostile } from "./perception.js";
 import { PearlAim, trajectory } from "../learn/pearl-aim.js";
+import { ARROW, flightPath, flightTicks, solvePitch } from "../learn/ballistics.js";
 import { baseMoves } from "./navigation.js";
 import { abortActiveSkill, isSkillRunning } from "../skills/executor.js";
 
@@ -299,6 +300,9 @@ export function startHunter(bot: Bot, brain: Pausable): void {
   let blocking = false;
   let win: Window | null = null;
   let pearlBusy = false;
+  let shootBusy = false;
+  /** When this bot's last arrow should hit (ms epoch); arrow hits are credited by timing. */
+  let arrowEta = 0;
   let lastHp = 20;
   let lastTargetSwing = 0;
   let lastTargetHurt = 0;
@@ -388,7 +392,7 @@ export function startHunter(bot: Bot, brain: Pausable): void {
     if (terminal === "kill") reward += 10;
     if (terminal === "death") reward -= 10;
     if (teamKill) reward += 5;
-    const nextOptions = next ? availableTactics(next, pearls(), shieldInOffhand(bot)) : [];
+    const nextOptions = next ? availableTactics(next, pearls(), shieldInOffhand(bot), hasBowAndArrows()) : [];
     combat.update(w.state, w.tactic, reward, terminal || teamKill ? null : next, nextOptions);
     const st = w.state;
     combat.record({
@@ -570,6 +574,86 @@ export function startHunter(bot: Bot, brain: Pausable): void {
     log: (m) => console.log(`[Hunt] ${bot.username} ${m}`),
   });
 
+  const ENGAGE_RANGE = 60;
+  const hasBowAndArrows = () =>
+    bot.inventory.items().some((i) => i.name === "bow") && bot.inventory.items().some((i) => i.name.endsWith("arrow"));
+
+  /**
+   * A full-draw shot at his chest, led by his velocity: yaw/pitch plus the
+   * flight time, or null when out of range or the traced path hits a block.
+   */
+  const planShot = (ent: Entity) => {
+    const eye = bot.entity.position;
+    const s = latestSighting(dimension(), 2500);
+    let aim = ent.position.offset(0, 1.2, 0);
+    let ticks = 0;
+    for (let i = 0; i < 2; i++) {
+      // Lead: where he will be when the arrow arrives (two refinement passes).
+      const lead = s ? s.vel.scaled(ticks / 20) : new Vec3(0, 0, 0);
+      aim = ent.position.offset(lead.x, 1.2, lead.z);
+      const d = Math.hypot(aim.x - eye.x, aim.z - eye.z);
+      const pitch = solvePitch(ARROW, d, aim.y - eye.y);
+      if (pitch === null) return null;
+      ticks = flightTicks(ARROW, pitch, d);
+    }
+    const dx = aim.x - eye.x;
+    const dz = aim.z - eye.z;
+    const d = Math.hypot(dx, dz);
+    if (d < 2) return null;
+    const pitch = solvePitch(ARROW, d, aim.y - eye.y);
+    if (pitch === null) return null;
+    // Trace the flight through the real blocks; stop 1 block short of him.
+    const path = flightPath(ARROW, pitch, aim.y - eye.y, d);
+    for (let i = 1; i < path.length; i++) {
+      const [ax, ay] = path[i - 1];
+      const [bx, by] = path[i];
+      const steps = Math.ceil(Math.hypot(bx - ax, by - ay) / 0.4);
+      for (let k = 1; k <= steps; k++) {
+        const fwd = ax + ((bx - ax) * k) / steps;
+        if (fwd > d - 1) return { yaw: Math.atan2(-dx, -dz), pitch, ticks };
+        const y = ay + ((by - ay) * k) / steps;
+        const b = bot.blockAt(new Vec3(eye.x + (dx / d) * fwd, eye.y + y, eye.z + (dz / d) * fwd).floored());
+        if (b && b.boundingBox === "block") return null;
+      }
+    }
+    return { yaw: Math.atan2(-dx, -dz), pitch, ticks };
+  };
+
+  /** Draw to full power (re-aiming as he moves), release, wait for the arrow. */
+  const shoot = async (ent: Entity) => {
+    const bow = bot.inventory.items().find((i) => i.name === "bow");
+    if (!bow) return;
+    shootBusy = true;
+    say(bot, "shoot", `Shooting at ${name}!`, 25_000);
+    try {
+      bot.pathfinder.setGoal(null);
+      resetMotion();
+      await bot.equip(bow, "hand");
+      bot.activateItem();
+      const drawStart = Date.now();
+      let plan = planShot(ent);
+      while (Date.now() - drawStart < 1100) {
+        plan = ent.isValid ? planShot(ent) ?? plan : plan;
+        if (plan) await bot.look(plan.yaw, plan.pitch, true);
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      if (!plan) {
+        bot.deactivateItem(); // lost the shot: release anyway, nothing to aim at
+        return;
+      }
+      await bot.look(plan.yaw, plan.pitch, true);
+      bot.deactivateItem();
+      arrowEta = Date.now() + plan.ticks * 50;
+      await new Promise((r) => setTimeout(r, Math.min(2500, plan.ticks * 50 + 300)));
+    } catch (err) {
+      console.warn(`[Hunt] ${bot.username} shot failed: ${(err as Error).message}`);
+    } finally {
+      shootBusy = false;
+      lastEquip = 0; // back to the sword on the next tick
+      if (win) win.start = 0; // a shot ends its decision window
+    }
+  };
+
   const swing = (ent: Entity) => {
     lowerShield();
     lastSwing = Date.now();
@@ -695,6 +779,9 @@ export function startHunter(bot: Bot, brain: Pausable): void {
       case "pearl_escape":
         if (!pearlBusy) void throwPearl(escapePoint(ent), "escape");
         break;
+      case "shoot":
+        if (!shootBusy) void shoot(ent);
+        break;
     }
   };
 
@@ -726,7 +813,7 @@ export function startHunter(bot: Bot, brain: Pausable): void {
       lastHp = bot.health;
       console.log(`[Hunt] ${bot.username} hunting ${name} (${target.distanceTo(bot.entity.position).toFixed(0)} blocks away, ${pearls()} pearls)`);
     }
-    if (pearlBusy) return;
+    if (pearlBusy || shootBusy) return;
     ensureHuntMoves();
     if (now - lastEquip > 5000) {
       lastEquip = now;
@@ -745,7 +832,7 @@ export function startHunter(bot: Bot, brain: Pausable): void {
       clearHelp(bot.username);
     }
 
-    if (ent && dist <= 40) {
+    if (ent && dist <= ENGAGE_RANGE) {
       if (!engaged) {
         engaged = true;
         pursuit.reset();
@@ -756,8 +843,15 @@ export function startHunter(bot: Bot, brain: Pausable): void {
         const prevTactic = win?.tactic;
         finish(state, null);
         // Physically possible tactics; pearls only when a clear arc exists.
-        const options = availableTactics(state, pearls(), shieldInOffhand(bot)).filter((t) =>
-          t === "pearl_close" ? !!planThrow(ent.position) : t === "pearl_escape" ? !!planThrow(escapePoint(ent)) : true,
+        // Physically possible tactics; pearls and arrows only with a clear path.
+        const options = availableTactics(state, pearls(), shieldInOffhand(bot), hasBowAndArrows()).filter((t) =>
+          t === "pearl_close"
+            ? !!planThrow(ent.position)
+            : t === "pearl_escape"
+              ? !!planThrow(escapePoint(ent))
+              : t === "shoot"
+                ? !!planShot(ent)
+                : true,
         );
         const { tactic, explored } = combat.choose(state, options);
         if (tactic !== prevTactic) resetMotion();
@@ -810,7 +904,10 @@ export function startHunter(bot: Bot, brain: Pausable): void {
     }
     if (e.username === name) {
       lastTargetHurt = now;
-      if (win && now - lastSwing < 600 && e.position.distanceTo(bot.entity.position) <= 4.5) {
+      const melee = now - lastSwing < 600 && e.position.distanceTo(bot.entity.position) <= 4.5;
+      const arrow = arrowEta > 0 && Math.abs(now - arrowEta) < 500;
+      if (win && (melee || arrow)) {
+        if (arrow) arrowEta = 0; // one arrow, one hit
         win.hits++;
         teamHits++;
       }

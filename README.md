@@ -61,11 +61,13 @@ Each bot in sight of the target makes a decision every 1.2 s.
 | | |
 |---|---|
 | **State features** (22) | bias · distance (≤3, 3–6, 6–12, 12–24, >24) · own health (≤6, ≤12, >12) · target shielding · height (below, level, above) · allies near target (0, 1–2, 3+) · target motion relative to the bot (still, approaching, fleeing) · target **busy** fighting (swung or was hit in the last 2 s, or a teammate is on him) · a mob on the bot · a teammate **calling for help** |
-| **Actions** (10) | `rush` · `crit` (jump, hit while falling: 1.5×) · `wtap` · `shield` · `strafe` · `retreat` · `pearl_close` · `pearl_escape` · `defend` (kill the mob on you) · `backup` (run to a hurt teammate and fight beside them) |
+| **Actions** (11) | `rush` · `crit` (jump, hit while falling: 1.5×) · `wtap` · `shield` · `strafe` · `retreat` · `pearl_close` · `pearl_escape` · `defend` (kill the mob on you) · `backup` (run to a hurt teammate and fight beside them) · `shoot` (full-draw bow shot led by his velocity, aimed with arrow ballistics in `src/learn/ballistics.ts` and traced through the blocks; reaches a player on a tower; hits credited by predicted arrival time) |
 | **Model** | Q(s,a) = w_a · φ(s), one weight vector per tactic; what is learned in one situation carries over to similar ones |
 | **Update** | w_a += (η/‖φ‖²)·(r + γ·max Q(s′,·) − Q(s,a))·φ(s), η = 0.3, γ = 0.8 (semi-gradient Q-learning) |
 | **Reward** | +1 per own hit on the target, **+0.25 per squadmate hit** (team play), +0.3 per hit on a mob that is on you, +0.5 for ending beside a teammate who called for help, −0.5 per HP lost, −0.05 per decision (finish fast), + distance-shaping Φ(s′) − Φ(s) with Φ = −distance/4, +10 kill, +5 squadmate kill, −10 death |
 | **Exploration** | ε-greedy with a per-state rate ε(s) = max(0.05, 0.5/√(1 + visits(s))) |
+
+First 3 minutes with bows (790 decisions): the learner already chose `shoot` for 27 % of decisions; 52 % of shots hit (55 % from beyond 30 blocks, i.e. at a player on a tower).
 
 Which tactic fits which situation is never hard-coded; only what is physically possible is
 (pearls need pearls and a clear arc, `defend` needs a mob, `backup` needs a call for help).
