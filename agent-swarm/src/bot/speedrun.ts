@@ -1609,16 +1609,20 @@ async function step(bot: Bot): Promise<void> {
     }
     case "fill": {
       if (!inOverworld(bot)) return;
-      // Whoever holds the most eyes fills the frames (the leader, normally).
+      // The bot nearest the portal does the filling, whoever carries the eyes: everyone
+      // else brings their eyes to it. (Picking the biggest holder sent the whole squad
+      // 4,000 blocks away from the frames to meet a far-off bot.)
+      const ep = state.endPortal;
+      const distEp = (b: Bot) => (ep && b.entity ? flat(b.entity.position, ep) : 0);
       const filler = squadBots()
         .filter((b) => b.entity && inOverworld(b))
-        .sort((a, b) => count(b, "ender_eye") - count(a, "ender_eye"))[0];
+        .sort((a, b) => distEp(a) - distEp(b))[0];
       if (bot === filler) return fillPortal(bot);
       if (count(bot, "ender_eye") && filler) {
         await handTo(bot, filler, ["ender_eye"]);
         return;
       }
-      await follow(bot, filler, 5);
+      if (filler?.entity) await follow(bot, filler, 5);
       return;
     }
     case "end":
