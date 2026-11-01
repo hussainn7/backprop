@@ -1237,6 +1237,7 @@ function cellSafe(bot: Bot, c: Vec3): boolean {
 async function descendTo(bot: Bot, targetY: number): Promise<boolean> {
   const until = Date.now() + 240_000;
   let i = 0;
+  let failures = 0;
   let aborted = "";
   doing(bot, `digging down to y=${targetY} (${Math.round(bot.entity.position.y - targetY)} to go)`);
   while (bot.entity && bot.entity.position.y > targetY + 1 && Date.now() < until && currentMode() === "game") {
@@ -1250,12 +1251,28 @@ async function descendTo(bot: Bot, targetY: number): Promise<boolean> {
       break;
     }
     await equip(bot, "netherite_pickaxe");
+    bot.pathfinder.setGoal(null);
+    // Dig each block until it is really gone: digs get aborted by whatever else touches the bot.
     for (const c of cells) {
-      const b = bot.blockAt(c);
-      if (b && b.boundingBox === "block") await bot.dig(b, true).catch(() => {});
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const b = bot.blockAt(c);
+        if (!b || b.boundingBox !== "block") break;
+        if (bot.targetDigBlock) {
+          bot.stopDigging();
+          await sleep(150);
+        }
+        await bot.dig(b, true).catch(() => {});
+        await sleep(120);
+      }
+    }
+    if (cells.some((c) => bot.blockAt(c)?.boundingBox === "block")) {
+      if (++failures >= 3) {
+        aborted = `cannot clear ${cells.find((c) => bot.blockAt(c)?.boundingBox === "block")}`;
+        break;
+      }
+      continue;
     }
     // Walk onto the cleared column; gravity drops the bot into the lowest cell.
-    bot.pathfinder.setGoal(null);
     const centre = ahead.offset(0.5, 0, 0.5);
     bot.setControlState("forward", true);
     const t = Date.now();
@@ -1267,9 +1284,13 @@ async function descendTo(bot: Bot, targetY: number): Promise<boolean> {
     }
     bot.setControlState("forward", false);
     if (bot.entity.position.y > p.y - 0.5) {
-      aborted = `stuck at ${p}`;
-      break;
+      if (++failures >= 3) {
+        aborted = `stuck at ${p}`;
+        break;
+      }
+      continue;
     }
+    failures = 0;
     i++;
     await topUp(bot);
   }
