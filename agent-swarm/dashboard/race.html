@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1117">
+<title>Dragon Race</title>
+<style>
+  :root {
+    --bg: #0f1117; --panel: #171a23; --line: #262b38; --text: #e6e8ee; --dim: #8a90a2; --faint: #5b6172;
+    --alpha: #4f9dff; --bravo: #ff8a3d; --charlie: #3fcf8e; --delta: #c77dff;
+    --nether: #ff5d5d; --end: #c9b6ff; --overworld: #7fd17f; --hp: #ff6b6b; --good: #3fcf8e;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  body { padding-bottom: calc(64px + env(safe-area-inset-bottom)); }
+  header { position: sticky; top: 0; z-index: 5; display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 14px; background: rgba(15,17,23,.92); backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 16px; letter-spacing: .5px; }
+  #live { font-size: 12px; color: var(--dim); }
+  #live b { color: var(--good); }
+  #live.stale b { color: var(--hp); }
+
+  main { padding: 12px; display: grid; gap: 12px; }
+  .view { display: none; }
+  .view.on { display: grid; gap: 12px; }
+  @media (min-width: 1000px) {
+    body { padding-bottom: 0; }
+    nav { display: none !important; }
+    main { grid-template-columns: 1.1fr 1.4fr 1fr; align-items: start; }
+    .view { display: grid !important; gap: 12px; }
+    #chatView { position: sticky; top: 56px; max-height: calc(100vh - 70px); }
+  }
+
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px; }
+  .card h2 { font-size: 13px; color: var(--dim); font-weight: 600; text-transform: uppercase; letter-spacing: .6px; margin-bottom: 8px; }
+
+  /* Leaderboard */
+  .rank { display: grid; grid-template-columns: 22px 1fr auto; gap: 8px; align-items: center; padding: 8px 0; border-top: 1px solid var(--line); }
+  .rank:first-of-type { border-top: 0; }
+  .pos { font-weight: 700; color: var(--faint); text-align: center; }
+  .sq { font-weight: 700; text-transform: capitalize; }
+  .phase { font-size: 12px; color: var(--dim); }
+  .track { display: flex; gap: 3px; margin-top: 6px; }
+  .track i { flex: 1; height: 6px; border-radius: 3px; background: var(--line); }
+  .track i.done { background: var(--c); }
+  .track i.now { background: var(--c); opacity: .45; animation: pulse 1.4s infinite; }
+  @keyframes pulse { 50% { opacity: .9; } }
+  .stats { text-align: right; font-size: 12px; color: var(--dim); white-space: nowrap; }
+  .stats b { color: var(--text); font-size: 15px; }
+  .splits { margin-top: 6px; font-size: 11px; color: var(--faint); display: flex; flex-wrap: wrap; gap: 4px 10px; }
+  .splits span b { color: var(--dim); font-weight: 600; }
+
+  /* Squad + bots */
+  .squadHead { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
+  .squadHead .sq { font-size: 15px; }
+  .bot { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; padding: 8px 0; border-top: 1px solid var(--line); }
+  .bot:first-of-type { border-top: 0; }
+  .name { font-weight: 600; }
+  .name small { color: var(--faint); font-weight: 400; margin-left: 4px; }
+  .crown { color: #ffd166; }
+  .dim { font-size: 11px; padding: 1px 6px; border-radius: 6px; border: 1px solid currentColor; }
+  .dim.nether { color: var(--nether); } .dim.end { color: var(--end); } .dim.overworld { color: var(--overworld); } .dim.off { color: var(--faint); }
+  .doing { grid-column: 1 / -1; font-size: 13px; color: var(--text); }
+  .doing .ago { color: var(--faint); font-size: 11px; margin-left: 4px; }
+  .meta { grid-column: 1 / -1; display: flex; gap: 10px; font-size: 11px; color: var(--dim); flex-wrap: wrap; align-items: center; }
+  .hpbar { width: 60px; height: 5px; background: var(--line); border-radius: 3px; overflow: hidden; display: inline-block; vertical-align: middle; }
+  .hpbar i { display: block; height: 100%; background: var(--hp); }
+  .offline { opacity: .45; }
+
+  /* Feeds */
+  .feed { display: flex; flex-direction: column; gap: 4px; max-height: 60vh; overflow-y: auto; font-size: 13px; overscroll-behavior: contain; }
+  .msg { padding: 5px 8px; border-radius: 8px; background: #11141c; word-break: break-word; }
+  .msg time { color: var(--faint); font-size: 11px; margin-right: 6px; }
+  .msg .who { font-weight: 600; margin-right: 4px; }
+  .msg.sys { color: var(--dim); font-style: italic; }
+  .msg.squad { border-left: 3px solid var(--c); }
+  .tabs2 { display: flex; gap: 6px; margin-bottom: 8px; }
+  .tabs2 button { flex: 1; }
+
+  nav { position: fixed; left: 0; right: 0; bottom: 0; display: flex; background: rgba(23,26,35,.97); border-top: 1px solid var(--line);
+    padding-bottom: env(safe-area-inset-bottom); z-index: 6; }
+  button { font: inherit; color: var(--dim); background: transparent; border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; cursor: pointer; }
+  button.on { color: var(--text); border-color: var(--text); }
+  nav button { flex: 1; border: 0; border-radius: 0; padding: 14px 0; font-weight: 600; }
+  nav button.on { color: var(--text); box-shadow: inset 0 2px 0 var(--text); }
+  .empty { color: var(--faint); font-size: 12px; padding: 6px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🐉 Dragon Race</h1>
+  <div id="live"><b>●</b> <span id="liveText">connecting…</span></div>
+</header>
+
+<main>
+  <section class="view on" id="raceView">
+    <div class="card"><h2>Leaderboard</h2><div id="board"></div></div>
+    <div class="card"><h2>Squad events</h2><div class="feed" id="events"></div></div>
+  </section>
+  <section class="view" id="botsView">
+    <div class="tabs2" id="squadFilter"></div>
+    <div id="squads" style="display:grid;gap:12px"></div>
+  </section>
+  <section class="view" id="chatView">
+    <div class="card" style="display:flex;flex-direction:column;min-height:0">
+      <h2>Live chat</h2>
+      <div class="feed" id="chat" style="max-height:none;flex:1"></div>
+    </div>
+  </section>
+</main>
+
+<nav>
+  <button class="on" data-view="raceView">Race</button>
+  <button data-view="botsView">Bots</button>
+  <button data-view="chatView">Chat</button>
+</nav>
+
+<script>
+const KEY = new URLSearchParams(location.search).get("k") || "";
+const COLORS = { alpha: "var(--alpha)", bravo: "var(--bravo)", charlie: "var(--charlie)", delta: "var(--delta)" };
+const PHASE_LABEL = {
+  portal: "Building Nether portal", nether: "Entering the Nether", fortress: "Searching for a fortress",
+  blaze: "Hunting blazes", home: "Heading home with rods", eyes: "Crafting eyes of ender",
+  stronghold: "Finding the stronghold", fill: "Filling the End portal", end: "Jumping into the End",
+  dragon: "Fighting the dragon", done: "DRAGON KILLED",
+};
+let squadFilter = "all";
+let lastChatLen = 0;
+
+document.querySelectorAll("nav button").forEach((b) => b.onclick = () => {
+  document.querySelectorAll("nav button").forEach((x) => x.classList.toggle("on", x === b));
+  document.querySelectorAll(".view").forEach((v) => v.classList.toggle("on", v.id === b.dataset.view));
+  if (b.dataset.view === "chatView") scrollChat(true);
+});
+
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const mmss = (ms) => { if (ms == null || ms < 0) return "–"; const s = Math.floor(ms / 1000); const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60), r = s % 60; return (h ? h + ":" + String(m).padStart(2, "0") : m) + ":" + String(r).padStart(2, "0"); };
+const ago = (t) => { if (!t) return ""; const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+  return s < 60 ? s + "s" : s < 3600 ? Math.floor(s / 60) + "m" : Math.floor(s / 3600) + "h"; };
+const clock = (t) => new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+
+function score(s) { // furthest phase first, then fewest minutes to reach it
+  if (s.offline) return -1;
+  const idx = s.phaseIndex ?? 0;
+  const reached = s.splits?.[s.phase] ? Date.parse(s.splits[s.phase]) - Date.parse(s.startedAt) : 1e12;
+  return idx * 1e13 + (1e12 - reached) + (s.rods || 0) * 1e3 + (s.eyes || 0);
+}
+
+function renderBoard(squads) {
+  const sorted = [...squads].sort((a, b) => score(b) - score(a));
+  document.getElementById("board").innerHTML = sorted.map((s, i) => {
+    const c = COLORS[s.squad];
+    if (s.offline) return `<div class="rank"><div class="pos">${i + 1}</div><div><span class="sq" style="color:${c}">${s.squad}</span><div class="phase">offline</div></div><div></div></div>`;
+    const phases = s.phases || [];
+    const track = phases.slice(0, -1).map((p, k) => `<i class="${k < s.phaseIndex || s.phase === "done" ? "done" : k === s.phaseIndex ? "now" : ""}"></i>`).join("");
+    const run = Date.now() - Date.parse(s.startedAt);
+    const splits = phases.filter((p) => s.splits?.[p] && p !== "portal")
+      .map((p) => `<span>${p} <b>${mmss(Date.parse(s.splits[p]) - Date.parse(s.startedAt))}</b></span>`).join("");
+    const leader = (s.bots || []).find((b) => b.leader)?.name ?? "";
+    return `<div class="rank" style="--c:${c}">
+      <div class="pos">${i + 1}</div>
+      <div><span class="sq" style="color:${c}">${s.squad}</span> <span class="phase">· ${esc(leader)}</span>
+        <div class="phase">${esc(PHASE_LABEL[s.phase] || s.phase)}</div>
+        <div class="track">${track}</div>
+        <div class="splits">${splits || "<span>no splits yet</span>"}</div></div>
+      <div class="stats"><b>${mmss(run)}</b><br>🔥 ${s.rods}/${s.rodTarget} · 👁 ${s.eyes}</div>
+    </div>`;
+  }).join("");
+}
+
+function renderEvents(squads) {
+  const all = [];
+  for (const s of squads) for (const e of s.events || []) all.push({ ...e, squad: s.squad });
+  all.sort((a, b) => b.at - a.at);
+  document.getElementById("events").innerHTML = all.slice(0, 50).map((e) =>
+    `<div class="msg squad" style="--c:${COLORS[e.squad]}"><time>${clock(e.at)}</time><span class="who" style="color:${COLORS[e.squad]}">${e.squad}</span>${esc(e.text)}</div>`
+  ).join("") || `<div class="empty">No events yet.</div>`;
+}
+
+function renderFilter(squads) {
+  const el = document.getElementById("squadFilter");
+  const names = ["all", ...squads.map((s) => s.squad)];
+  el.innerHTML = names.map((n) => `<button class="${n === squadFilter ? "on" : ""}" data-sq="${n}" style="${n !== "all" ? `color:${COLORS[n]}` : ""}">${n}</button>`).join("");
+  el.querySelectorAll("button").forEach((b) => b.onclick = () => { squadFilter = b.dataset.sq; render(lastData); });
+}
+
+function renderSquads(squads) {
+  document.getElementById("squads").innerHTML = squads.filter((s) => squadFilter === "all" || s.squad === squadFilter).map((s) => {
+    const c = COLORS[s.squad];
+    if (s.offline) return `<div class="card"><div class="squadHead"><span class="sq" style="color:${c}">${s.squad}</span><span class="phase">offline</span></div></div>`;
+    const bots = (s.bots || []).map((b) => {
+      const dim = b.online ? b.dim : "off";
+      const hp = b.hp ?? 0;
+      return `<div class="bot ${b.online ? "" : "offline"}">
+        <div class="name">${b.leader ? '<span class="crown">♛</span> ' : b.captain ? '<span class="crown" title="in charge">⚑</span> ' : ""}${esc(b.name)}<small>${esc(b.role)}</small></div>
+        <div><span class="dim ${dim}">${b.online ? esc(b.dim) : "offline"}</span></div>
+        <div class="doing">${esc(b.doing)}<span class="ago">${b.doingAt ? ago(b.doingAt) : ""}</span></div>
+        <div class="meta">
+          ${b.online ? `<span><span class="hpbar"><i style="width:${Math.min(100, hp * 5)}%"></i></span> ${hp}/20</span>` : ""}
+          ${b.online ? `<span>🍗 ${b.food}</span>` : ""}
+          ${b.pos ? `<span>📍 ${b.pos.join(" ")}</span>` : ""}
+          ${b.held ? `<span>✋ ${esc(b.held.replace(/_/g, " "))}</span>` : ""}
+          ${b.rods ? `<span>🔥 ${b.rods}</span>` : ""}${b.eyes ? `<span>👁 ${b.eyes}</span>` : ""}
+        </div>
+      </div>`;
+    }).join("");
+    return `<div class="card" style="border-top:3px solid ${c}">
+      <div class="squadHead"><span class="sq" style="color:${c}">${s.squad}</span><span class="phase">${esc(PHASE_LABEL[s.phase] || s.phase)} · 🔥 ${s.rods}/${s.rodTarget} · 👁 ${s.eyes}</span></div>
+      ${bots}</div>`;
+  }).join("");
+}
+
+const BOT_SQUAD = {};
+function renderChat(chat) {
+  const el = document.getElementById("chat");
+  const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  el.innerHTML = chat.map((m) => {
+    const t = m.text;
+    const said = t.match(/^<([^>]+)>\s?(.*)$/);
+    if (said) {
+      const sq = BOT_SQUAD[said[1]];
+      const c = sq ? COLORS[sq] : "var(--text)";
+      return `<div class="msg ${sq ? "squad" : ""}" style="--c:${c}"><time>${clock(m.at)}</time><span class="who" style="color:${c}">${esc(said[1])}</span>${esc(said[2])}</div>`;
+    }
+    return `<div class="msg sys"><time>${clock(m.at)}</time>${esc(t)}</div>`;
+  }).join("") || `<div class="empty">No chat yet.</div>`;
+  if (nearBottom || chat.length !== lastChatLen) scrollChat(nearBottom || lastChatLen === 0);
+  lastChatLen = chat.length;
+}
+function scrollChat(force) { const el = document.getElementById("chat"); if (force) el.scrollTop = el.scrollHeight; }
+
+let lastData = null;
+function render(d) {
+  if (!d) return;
+  for (const s of d.squads) for (const b of s.bots || []) BOT_SQUAD[b.name] = s.squad;
+  renderBoard(d.squads);
+  renderEvents(d.squads);
+  renderFilter(d.squads);
+  renderSquads(d.squads);
+  renderChat(d.chat || []);
+}
+
+async function poll() {
+  try {
+    const r = await fetch(`/api/race?k=${encodeURIComponent(KEY)}`, { cache: "no-store" });
+    if (!r.ok) throw new Error(r.status);
+    lastData = await r.json();
+    render(lastData);
+    document.getElementById("live").classList.remove("stale");
+    document.getElementById("liveText").textContent = "live · " + clock(lastData.at);
+  } catch (e) {
+    document.getElementById("live").classList.add("stale");
+    document.getElementById("liveText").textContent = "reconnecting…";
+  }
+  setTimeout(poll, 2000);
+}
+poll();
+</script>
+</body>
+</html>

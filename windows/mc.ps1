@@ -114,7 +114,19 @@ switch ($Cmd) {
             }
         }
     }
-    'logs' { $p = if ($Rest) { $Rest[0] } else { 'alpha' }; Get-Content (Join-Path $Logs "$(LogName $p).log") -Tail 80 -Wait }
+    'race' {
+        # Speedrun director split times per squad (agent-swarm/logs/speedrun-<squad>.json).
+        $phases = 'portal', 'nether', 'fortress', 'blaze', 'home', 'eyes', 'stronghold', 'fill', 'end', 'dragon', 'done'
+        foreach ($s in $SquadNames) {
+            $f = Join-Path $Swarm "logs\speedrun-$s.json"
+            if (-not (Test-Path $f)) { "${s}: not started"; continue }
+            $r = Get-Content $f -Raw | ConvertFrom-Json
+            $t0 = [datetime]$r.startedAt
+            $splits = foreach ($p in $phases) { $t = $r.splits.$p; if ($t) { '{0} {1:mm\:ss}' -f $p, ([datetime]$t - $t0) } }
+            '{0,-8} now {1,-10} | {2}' -f $s, $r.phase, ($splits -join '  ')
+        }
+    }
+    'logs' { $p =if ($Rest) { $Rest[0] } else { 'alpha' }; Get-Content (Join-Path $Logs "$(LogName $p).log") -Tail 80 -Wait }
     'console' { Rcon $Rest }
     'budget' {
         foreach ($s in $SquadNames) {
