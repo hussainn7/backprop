@@ -169,6 +169,9 @@ export function baseMoves(bot: Bot): InstanceType<typeof Movements> {
   // into the lava sea on three days; the fortress sweep's own cap never
   // applied because every walk builds its moves here. In the Nether a
   // drop is a stair or a cliff over lava: two blocks, no more.
+  // Speedrun director: the pathfinder never places blocks (no bridging an ocean, no towers). Water is
+  // swum by the swim controller and climbs are cut by the director's own stairs and pillars.
+  if (process.env.SPEEDRUN_DIRECTOR === "true") moves.scafoldingBlocks.length = 0;
   if (String(bot.game?.dimension ?? "").includes("nether")) {
     moves.maxDropDown = 2;
     // No placing in the Nether: a bridge or tower block that misses is a fall into the lava sea,
