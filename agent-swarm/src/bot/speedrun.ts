@@ -1469,10 +1469,7 @@ async function swimOutOfLava(bot: Bot, to: { x: number; z: number }, targetY: nu
       const f = pos.floored();
       const inLava = bot.blockAt(f)?.name === "lava" || bot.blockAt(f.offset(0, 1, 0))?.name === "lava";
       const below = bot.blockAt(f.offset(0, -1, 0));
-      if (!inLava && below?.boundingBox === "block" && !/lava/.test(below.name) && pos.y > targetY - 40) {
-        // On land: only done once there is no lava right beside us either.
-        if (!lavaNear(bot, 1)) return true;
-      }
+      if (!inLava && below?.boundingBox === "block" && !/lava/.test(below.name)) return true; // on solid ground
       if (!hasFireResistance(bot) && !(await fireResist(bot, "swimming in lava"))) return false;
       await bot.lookAt(new Vec3(to.x + 0.5, pos.y + 1.0, to.z + 0.5), true).catch(() => {});
       bot.setControlState("jump", true);
@@ -1904,8 +1901,23 @@ interface Pausable {
 
 const order = (name: string) => squadBots().map((b) => b.username).sort().indexOf(name);
 
+/** The bot is in lava itself (feet or head cell). */
+function inLavaNow(bot: Bot): boolean {
+  const f = bot.entity.position.floored();
+  return bot.blockAt(f)?.name === "lava" || bot.blockAt(f.offset(0, 1, 0))?.name === "lava";
+}
+
 async function step(bot: Bot): Promise<void> {
   const me = bot.username;
+  // The pathfinder cannot plan from inside lava, and with fire resistance bots end up there:
+  // swim out toward wherever this phase is headed before doing anything else.
+  if (inLavaNow(bot)) {
+    const dest =
+      state.phase === "home" && state.netherPortal
+        ? state.netherPortal
+        : state.spawner ?? state.fortress ?? state.netherPortal ?? { x: bot.entity.position.x, z: bot.entity.position.z };
+    if (await swimOutOfLava(bot, dest, bot.entity.position.y)) return;
+  }
   await keepRoom(bot);
   if (inNether(bot)) await topUp(bot);
   // The overworld half of the route is run by the captain (the leader when it is there).
