@@ -773,9 +773,11 @@ export function startHunter(bot: Bot, brain: Pausable): void {
       }
       act(ent, win.tactic, dist, now);
     } else {
-      // Not in sight: no learning. Head for where he WILL be (intercept), using
-      // a squadmate's sighting and his velocity, else his last known position.
-      finish(null, null);
+      // Out of sight or range: close the last window against his real distance,
+      // so backing off out of range is penalized like any other retreat (closing
+      // it with no next state skipped the shaping term, and bots learned to
+      // retreat past 40 blocks for free). Then head for where he WILL be.
+      if (win) finish({ ...win.state, dist }, null);
       if (engaged) {
         engaged = false;
         resetMotion();
