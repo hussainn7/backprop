@@ -1246,8 +1246,14 @@ async function descendTo(bot: Bot, targetY: number): Promise<boolean> {
     const ahead = p.offset(dx, 0, dz);
     const cells = [ahead.offset(0, 1, 0), ahead, ahead.offset(0, -1, 0)];
     const floor = ahead.offset(0, -2, 0);
-    const floorBlock = bot.blockAt(floor);
-    const floorOk = floorBlock?.boundingBox === "block" || /water/.test(floorBlock?.name ?? "");
+    // Floor: solid or water within a 5-block drop (Feather Falling boots), with no lava on landing.
+    let floorOk = false;
+    for (let k = 0; k <= 5 && !floorOk; k++) {
+      const fb = bot.blockAt(floor.offset(0, -k, 0));
+      if (!fb) break;
+      if (HAZARD.test(fb.name)) break;
+      if (fb.boundingBox === "block" || /water/.test(fb.name)) floorOk = !HAZARD.test(bot.blockAt(floor.offset(0, -k + 1, 0))?.name ?? "");
+    }
     if (!cells.every((c) => cellSafe(bot, c)) || !floorOk) {
       aborted = `unsafe step at ${ahead} (floor ${bot.blockAt(floor)?.name})`;
       break;
