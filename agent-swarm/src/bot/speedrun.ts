@@ -2451,8 +2451,7 @@ export function startSpeedrun(bot: Bot, brain: Pausable): void {
         const r = orig(...a);
         const ms = Date.now() - t;
         if (ms > 100) {
-          const caller = String(new Error().stack ?? "").split("
-").slice(2, 5).map((l) => l.trim().replace(/^at /, "").replace(/\(.*[\/]/, "(")).join(" < ");
+          const caller = String(new Error().stack ?? "").split(String.fromCharCode(10)).slice(2, 5).map((l) => l.trim().replace(/^at /, "")).join(" < ");
           console.warn(`[Slow] ${bot.username} ${fn} took ${ms} ms (${JSON.stringify((a[0] as { maxDistance?: number })?.maxDistance ?? "")}) ${caller}`);
         }
         return r;
